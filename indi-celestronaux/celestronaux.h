@@ -601,6 +601,9 @@ class CelestronAUX :
         /// Map an INDI dew/power channel index back to a bus port index.
         int busPortForDewChannel(size_t channel) const;
         int busPortForPowerChannel(size_t channel) const;
+        int busPortForVariableChannel(size_t channel) const;
+        int busPortForUSBChannel(size_t channel) const;
+        bool setDewPowerPortVoltage(uint8_t port, uint16_t voltage_mV);
 
         // INDI::PowerInterface
         bool SetPowerPort(size_t port, bool enabled) override;
@@ -608,6 +611,7 @@ class CelestronAUX :
         bool SetVariablePort(size_t port, bool enabled, double voltage) override;
         bool SetLEDEnabled(bool enabled) override;
         bool SetAutoDewEnabled(size_t port, bool enabled) override;
+        bool SetUSBPort(size_t port, bool enabled) override;
 
         // INDI::WeatherInterface
         IPState updateWeather() override;
@@ -619,6 +623,8 @@ class CelestronAUX :
         /// Bus port indices by category, in the order INDI numbers them.
         std::vector<uint8_t> m_DewChannelPorts;
         std::vector<uint8_t> m_PowerChannelPorts;
+        std::vector<uint8_t> m_VariableChannelPorts;
+        std::vector<uint8_t> m_USBChannelPorts;
 
         /// GET_PORT_INFO and GET_DH_PORT_INFO replies do not echo the port
         /// index, so remember which one we asked about. Reads are synchronous

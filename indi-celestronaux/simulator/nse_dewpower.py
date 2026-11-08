@@ -47,10 +47,9 @@ CORRECTED BY THAT PROBE
 
 STILL UNVERIFIED
 ----------------
-  * Everything about the 4X: its port count, type codes, and how its
-    variable-voltage port is identified over AUX. The '4x' profile is an
-    extrapolation -- probe one before trusting it.
-  * Whether the 4X's three USB ports are enumerated at all (omitted here).
+  * Category 0x2 has never been seen on either model.
+  * Whether a USB port reports current. All three read 0 mW with nothing
+    plugged in, so this is untested rather than known-absent.
   * All the SET_* commands. Only read commands have been exercised on
     hardware; nothing here has been confirmed to *change* anything.
 """
@@ -145,8 +144,10 @@ cmd_names = {
 # a flag, or not distinguished at all over AUX. Hence `variable` is an explicit
 # per-port flag in PORT_PROFILES below rather than being inferred from a code.
 # ---------------------------------------------------------------------------
-CAT_DEW   = 0x0
-CAT_POWER = 0x1
+CAT_DEW      = 0x0   # 2X: 0x01-0x02   4X: 0x01-0x04
+CAT_POWER    = 0x1   # fixed 12V output
+CAT_USB      = 0x3   # 4X only: 0x31-0x33, reporting 5000 mV
+CAT_VARIABLE = 0x4   # 4X only: 0x41, 3.0-11.0 V or 12.0 V
 
 
 def port_category(type_code):
@@ -191,19 +192,23 @@ PORT_PROFILES = {
         (0x11, 12197, 4890, 0, False),  # 12V output -- powers the mount, 4.89 W
     ],
     # Smart DewHeater and Power Controller 4X, #94036.
-    # NOT VERIFIED. Port count (4 dew + 4 power) is from the manual; the type
-    # codes are the hypothesis above extrapolated from the 2X, and the variable
-    # flag on power port #1 is from the manual rather than from the bus. Probe
-    # a real 4X with ./aux-probe.py before trusting any of this.
+    # MEASURED on Bob's unit (firmware 1.0) on 2026-11-08: 11 ports, not the 8
+    # previously guessed -- the USB hub is enumerated after all, and the
+    # variable port has its own category rather than being a flagged power
+    # port. Fixed outputs are indexed 2..4 because power port #1 IS the
+    # variable one.
     '4x': [
-        (0x01, 12000, 1800, 5, False),  # dew heater 1
-        (0x02, 12000, 2400, 5, False),  # dew heater 2
-        (0x03, 12000,    0, 5, False),  # dew heater 3 -- idle
-        (0x04, 12000,    0, 5, False),  # dew heater 4 -- idle
-        (0x11, 12000, 25000, 0, True),   # power #1 -- variable 3.0-11.0/12.0V
-        (0x12, 12000, 60000, 0, False),  # power #2
-        (0x13, 12000,    0, 0, False),  # power #3 -- idle
-        (0x14, 12000,    0, 0, False),  # power #4 -- idle
+        (0x01, 12000,    0, 5, False),  # dew heater 1 (thermistor fitted)
+        (0x02, 12000,    0, 5, False),  # dew heater 2
+        (0x03, 12000,    0, 5, False),  # dew heater 3
+        (0x04, 12000,    0, 5, False),  # dew heater 4
+        (0x41, 12000,    0, 0, True),   # variable -- the manual's power port #1
+        (0x12, 12257, 1010, 0, False),  # fixed 12V output 2, drawing 1.01 W
+        (0x13, 12257,    0, 0, False),  # fixed 12V output 3
+        (0x14, 12257,    0, 0, False),  # fixed 12V output 4
+        (0x31,  5000,    0, 0, False),  # USB 1
+        (0x32,  5000,    0, 0, False),  # USB 2
+        (0x33,  5000,    0, 0, False),  # USB 3
     ],
 }
 
@@ -436,10 +441,16 @@ class DewPowerController:
         p = self._port(data)
         if p is None:
             return _NAK
-        # Measured: a DEW port answers with its type byte and nothing else,
-        # even at 100% duty drawing 7.9 W. Its telemetry lives in
-        # GET_DH_PORT_INFO instead. Only power ports ever give the long form.
-        if p.is_dew or not p.is_active():
+        # Measured on both models: the long form depends on the port's
+        # CATEGORY, not on whether it is drawing.
+        #   * a DEW port answers with its type byte and nothing else, even at
+        #     100% duty drawing 7.9 W -- its telemetry is in GET_DH_PORT_INFO
+        #   * every non-dew port answers with the full 7 bytes even when idle
+        #     at 0 mW, as all eight of the 4X's power/variable/USB ports did
+        # The earlier "idle ports reply with only their type" reading was
+        # wrong: it happened to fit the 2X only because its idle ports were
+        # the dew ones.
+        if p.is_dew:
             return bytes((p.type,))
         return (bytes((p.type, 1 if p.enabled else 0, 1 if p.shorted else 0))
                 + struct.pack('!HH', p.power_wire(), p.voltage_mV))
@@ -488,7 +499,7 @@ class DewPowerController:
         p = self._port(data)
         if p is None or len(data) < 3:
             return _NAK
-        if not p.variable:
+        if not (p.variable or p.category == CAT_VARIABLE):
             return _NAK
         mV = struct.unpack('!H', data[1:3])[0]
         # Manual: 3.0-11.0V in steps, or 12.0V.

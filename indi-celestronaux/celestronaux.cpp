@@ -3071,7 +3071,7 @@ bool CelestronAUX::detectDewPower()
     LOGF_INFO("Dew/power controller reports %d ports.", m_NumDewPowerPorts);
 
     m_DewPowerPorts.resize(m_NumDewPowerPorts);
-    size_t dewPorts = 0, powerPorts = 0, variablePorts = 0;
+    size_t dewPorts = 0, powerPorts = 0, variablePorts = 0, usbPorts = 0;
     for (uint8_t i = 0; i < m_NumDewPowerPorts; i++)
     {
         if (!getDewPowerPortInfo(i))
@@ -3092,6 +3092,14 @@ bool CelestronAUX::detectDewPower()
                 port.indiIndex = powerPorts++;
                 m_PowerChannelPorts.push_back(i);
                 break;
+            case PORTCTRL_CAT_VARIABLE:
+                port.indiIndex = variablePorts++;
+                m_VariableChannelPorts.push_back(i);
+                break;
+            case PORTCTRL_CAT_USB:
+                port.indiIndex = usbPorts++;
+                m_USBChannelPorts.push_back(i);
+                break;
             default:
                 // Unrecognised category. Say so loudly rather than silently
                 // dropping the port the way the standalone driver does -- on a
@@ -3103,7 +3111,8 @@ bool CelestronAUX::detectDewPower()
         }
     }
 
-    if (m_DewChannelPorts.empty() && m_PowerChannelPorts.empty())
+    if (m_DewChannelPorts.empty() && m_PowerChannelPorts.empty()
+            && m_VariableChannelPorts.empty() && m_USBChannelPorts.empty())
     {
         LOG_ERROR("Dew/power controller reported no usable ports.");
         return false;
@@ -3115,9 +3124,13 @@ bool CelestronAUX::detectDewPower()
         capabilities |= POWER_HAS_DC_OUT | POWER_HAS_PER_PORT_CURRENT;
     if (!m_DewChannelPorts.empty())
         capabilities |= POWER_HAS_DEW_OUT | POWER_HAS_AUTO_DEW | POWER_HAS_PER_PORT_CURRENT;
+    if (!m_VariableChannelPorts.empty())
+        capabilities |= POWER_HAS_VARIABLE_OUT;
+    if (!m_USBChannelPorts.empty())
+        capabilities |= POWER_HAS_USB_TOGGLE;
 
     PI::SetCapability(capabilities);
-    PI::initProperties(POWER_TAB, powerPorts, dewPorts, variablePorts, dewPorts, 0);
+    PI::initProperties(POWER_TAB, powerPorts, dewPorts, variablePorts, dewPorts, usbPorts);
 
     // Per-port dew aggression. PowerInterface's auto-dew switch is a plain
     // on/off, but the controller holds a settable "degrees above dew point"
@@ -3267,6 +3280,32 @@ int CelestronAUX::busPortForPowerChannel(size_t channel) const
     return m_PowerChannelPorts[channel];
 }
 
+int CelestronAUX::busPortForVariableChannel(size_t channel) const
+{
+    if (channel >= m_VariableChannelPorts.size())
+        return -1;
+    return m_VariableChannelPorts[channel];
+}
+
+int CelestronAUX::busPortForUSBChannel(size_t channel) const
+{
+    if (channel >= m_USBChannelPorts.size())
+        return -1;
+    return m_USBChannelPorts[channel];
+}
+
+bool CelestronAUX::setDewPowerPortVoltage(uint8_t port, uint16_t voltage_mV)
+{
+    AUXBuffer payload {port, static_cast<uint8_t>(voltage_mV >> 8),
+                       static_cast<uint8_t>(voltage_mV & 0xFF)};
+    AUXCommand cmd(PORTCTRL_SET_PORT_VOLTAGE, APP, DEW_POWER_CTRL, payload);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    if (port < m_DewPowerPorts.size())
+        m_DewPowerPorts[port].voltage_mV = voltage_mV;
+    return true;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////
 ///
 /////////////////////////////////////////////////////////////////////////////////////
@@ -3302,15 +3341,34 @@ bool CelestronAUX::SetDewPort(size_t port, bool enabled, double dutyCycle)
 
 bool CelestronAUX::SetVariablePort(size_t port, bool enabled, double voltage)
 {
-    // No variable-voltage port has ever been seen on the bus. The 4X is
-    // documented to have one (power port #1, 3.0-11.0 V or 12.0 V) but how it
-    // is identified in the port type byte is unknown, so none is ever
-    // advertised and this should not be reachable.
-    INDI_UNUSED(port);
-    INDI_UNUSED(enabled);
-    INDI_UNUSED(voltage);
-    LOG_ERROR("Variable voltage ports are not supported: none has been identified on the AUX bus.");
-    return false;
+    // Category 0x4, confirmed on a 4X: SET_PORT_VOLTAGE is accepted there and
+    // NAK'd on the fixed 12V and USB ports.
+    int busPort = busPortForVariableChannel(port);
+    if (busPort < 0)
+        return false;
+    if (!enabled)
+        return setDewPowerPortEnabled(busPort, false);
+    if (!m_DewPowerPorts[busPort].enabled && !setDewPowerPortEnabled(busPort, true))
+        return false;
+
+    // The manual allows 3.0-11.0 V, or 12.0 V. Anything else is refused here
+    // rather than sent, because an out-of-range voltage on this port can
+    // damage whatever is plugged into it.
+    auto mV = static_cast<uint16_t>(std::lround(voltage * 1000.0));
+    if (!((mV >= 3000 && mV <= 11000) || mV == 12000))
+    {
+        LOGF_ERROR("Variable port voltage %.1f V out of range: use 3.0-11.0 V or 12.0 V.", voltage);
+        return false;
+    }
+    return setDewPowerPortVoltage(busPort, mV);
+}
+
+bool CelestronAUX::SetUSBPort(size_t port, bool enabled)
+{
+    int busPort = busPortForUSBChannel(port);
+    if (busPort < 0)
+        return false;
+    return setDewPowerPortEnabled(busPort, enabled);
 }
 
 bool CelestronAUX::SetLEDEnabled(bool enabled)
@@ -3399,6 +3457,43 @@ void CelestronAUX::pollDewPower()
     {
         PI::PowerChannelCurrentNP.setState(IPS_OK);
         PI::PowerChannelCurrentNP.apply();
+    }
+
+    // Variable-voltage channels (4X only).
+    for (size_t i = 0; i < m_VariableChannelPorts.size(); i++)
+    {
+        uint8_t busPort = m_VariableChannelPorts[i];
+        getDewPowerPortInfo(busPort);
+        const auto &port = m_DewPowerPorts[busPort];
+        if (i < PI::VariableChannelsSP.count())
+            PI::VariableChannelsSP[i].setState(port.enabled ? ISS_ON : ISS_OFF);
+        if (i < PI::VariableChannelVoltsNP.count() && port.voltage_mV)
+            PI::VariableChannelVoltsNP[i].setValue(port.voltage_mV / 1000.0);
+    }
+    if (PI::VariableChannelsSP.count())
+    {
+        PI::VariableChannelsSP.setState(IPS_OK);
+        PI::VariableChannelsSP.apply();
+    }
+    if (PI::VariableChannelVoltsNP.count())
+    {
+        PI::VariableChannelVoltsNP.setState(IPS_OK);
+        PI::VariableChannelVoltsNP.apply();
+    }
+
+    // USB ports (4X only). These report 5000 mV and have no current sensor of
+    // their own, so only their on/off state is meaningful.
+    for (size_t i = 0; i < m_USBChannelPorts.size(); i++)
+    {
+        uint8_t busPort = m_USBChannelPorts[i];
+        getDewPowerPortInfo(busPort);
+        if (i < PI::USBPortSP.count())
+            PI::USBPortSP[i].setState(m_DewPowerPorts[busPort].enabled ? ISS_ON : ISS_OFF);
+    }
+    if (PI::USBPortSP.count())
+    {
+        PI::USBPortSP.setState(IPS_OK);
+        PI::USBPortSP.apply();
     }
 
     // Dew heater channels.

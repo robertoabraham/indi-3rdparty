@@ -147,12 +147,46 @@ def test_2x_aggression_is_per_port(ctrl_2x):
     assert ctrl_2x.ports[1].aggression_C == 5
 
 
-def test_4x_has_four_dew_four_power_one_variable(ctrl_4x):
+def test_4x_port_type_codes_match_bobs_hardware(ctrl_4x):
+    """
+    Measured on Bob's 4X (firmware 1.0) on 2026-11-08. Eleven ports, not the
+    eight previously guessed: the USB hub IS enumerated, and the variable port
+    carries its own category rather than being a flagged power port. The fixed
+    outputs are indexed 2..4 because power port #1 is the variable one.
+    """
+    assert [p.type for p in ctrl_4x.ports] == [
+        0x01, 0x02, 0x03, 0x04,     # four dew heaters
+        0x41,                       # variable -- the manual's power port #1
+        0x12, 0x13, 0x14,           # three fixed 12V outputs
+        0x31, 0x32, 0x33,           # three USB ports
+    ]
+
+
+def test_4x_categories(ctrl_4x):
     cats = [p.category for p in ctrl_4x.ports]
-    assert len(cats) == 8, 'the 4X manual describes 4 dew + 4 power outputs'
+    assert len(cats) == 11
     assert cats.count(dp.CAT_DEW) == 4
-    assert cats.count(dp.CAT_POWER) == 4
-    assert sum(p.variable for p in ctrl_4x.ports) == 1, 'power #1 is variable'
+    assert cats.count(dp.CAT_POWER) == 3
+    assert cats.count(dp.CAT_VARIABLE) == 1
+    assert cats.count(dp.CAT_USB) == 3
+
+
+def test_4x_usb_ports_report_five_volts(ctrl_4x):
+    """5000 mV on exactly three ports is what identifies the USB hub."""
+    usb = [p for p in ctrl_4x.ports if p.category == dp.CAT_USB]
+    assert len(usb) == 3
+    assert all(p.voltage_mV == 5000 for p in usb)
+
+
+def test_set_port_voltage_accepted_only_on_the_variable_port(ctrl_4x):
+    """
+    MEASURED: accepted on 0x41, NAK'd on the fixed 12V output and on USB.
+    That is what pins down which port is the variable one.
+    """
+    volts = struct.pack('!H', 12000)
+    assert ctrl_4x.handle(dp.SET_PORT_VOLTAGE, b'\x04' + volts)[0] == dp.SET_PORT_VOLTAGE
+    assert ctrl_4x.handle(dp.SET_PORT_VOLTAGE, b'\x05' + volts)[0] == dp.NAK
+    assert ctrl_4x.handle(dp.SET_PORT_VOLTAGE, b'\x08' + struct.pack('!H', 5000))[0] == dp.NAK
 
 
 def test_unknown_model_rejected():
@@ -225,50 +259,63 @@ def test_observed_hardware_defaults(ctrl_2x):
 
 
 def test_number_of_ports_matches_profile(scope_4x):
-    assert ask(scope_4x, dp.GET_NUMBER_OF_PORTS)['data'] == b'\x08'
+    assert ask(scope_4x, dp.GET_NUMBER_OF_PORTS)['data'] == b'\x0b'
 
 
 # --------------------------------------------------------------------------- #
 # Port info, including the idle-port quirk
 # --------------------------------------------------------------------------- #
-def test_active_power_port_returns_full_telemetry(ctrl_4x):
-    """Port 5 is a fixed 12V output with a load, so it reports the long form."""
+def test_power_port_returns_full_telemetry(ctrl_4x):
+    """Port 5 is a fixed 12V output drawing 1.01 W, as measured."""
     _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')
     assert len(data) == 7
     ptype, enabled, shorted = data[0], data[1], data[2]
     power_cW, voltage_mV = struct.unpack('!HH', data[3:7])
     assert dp.port_category(ptype) == dp.CAT_POWER
     assert enabled == 1 and shorted == 0
-    assert power_cW == 6000, "60000 mW reported as 10 mW units"
-    assert voltage_mV == 12000
+    assert power_cW == 101, "1010 mW reported as 10 mW units"
+    assert voltage_mV == 12257
 
 
-def test_dew_port_never_returns_the_long_form(ctrl_4x):
+def test_idle_non_dew_ports_still_return_the_long_form(ctrl_4x):
+    """
+    MEASURED: the long form depends on CATEGORY, not on drawing current. All
+    eight of the 4X's power/variable/USB ports answered with 7 bytes while
+    reading 0 mW. The earlier "idle ports reply with only their type" rule was
+    wrong -- it fitted the 2X only because its idle ports were the dew ones.
+    """
+    for port in (4, 6, 7, 8, 9, 10):            # variable, 2 power, 3 USB
+        _, data = ctrl_4x.handle(dp.GET_PORT_INFO, bytes((port,)))
+        assert len(data) == 7, 'port %d should give the long form' % port
+        assert struct.unpack('!H', data[3:5])[0] == 0, 'and be idle'
+
+
+def test_dew_port_never_returns_the_long_form(ctrl_2x):
     """
     MEASURED: a dew port answers GET_PORT_INFO with its type byte and nothing
     else, even at 100% duty drawing 7.9 W. Its telemetry is in
     GET_DH_PORT_INFO instead. The "full telemetry when drawing" rule applies
     only to power ports.
     """
-    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # port 0, 100%
-    _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x00')
+    ctrl_2x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # port 0, 100%
+    _, data = ctrl_2x.handle(dp.GET_PORT_INFO, b'\x00')
     assert len(data) == 1
     assert dp.port_category(data[0]) == dp.CAT_DEW
     # ...while the dew-specific query does report the draw.
-    _, dh = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    _, dh = ctrl_2x.handle(dp.GET_DH_PORT_INFO, b'\x00')
     assert struct.unpack('!H', dh[3:5])[0] > 0
 
 
-def test_power_is_reported_in_ten_milliwatt_units(ctrl_4x):
+def test_power_is_reported_in_ten_milliwatt_units(ctrl_2x):
     """
     MEASURED on a 2X with a real dew heater ring: the field reads 744 at 100%
     duty while input current rises 652 mA at 12.2 V, i.e. 7.9 W. Treating it
     as milliwatts -- as the standalone driver's comments do -- under-reports
-    by 10x. The 4X profile's dew port 0 carries an 1800 mW load.
+    by 10x. The 2X profile carries Bob's actual ring, 7440 mW at full duty.
     """
-    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # 100%
-    _, dh = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
-    assert struct.unpack('!H', dh[3:5])[0] == 180            # 1800 mW / 10
+    ctrl_2x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # 100%
+    _, dh = ctrl_2x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert struct.unpack('!H', dh[3:5])[0] == 744            # 7440 mW / 10
 
 
 def test_idle_port_returns_only_its_type(ctrl_4x):
@@ -282,10 +329,18 @@ def test_idle_port_returns_only_its_type(ctrl_4x):
     assert dp.port_category(data[0]) == dp.CAT_DEW
 
 
-def test_disabling_a_power_port_makes_it_idle(ctrl_4x):
-    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')[1]) == 7
+def test_disabling_a_power_port_clears_its_enabled_flag(ctrl_4x):
+    """
+    The reply stays 7 bytes -- length is category-driven. What changes is the
+    enabled byte, and the draw falls to zero.
+    """
+    _, before = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')
+    assert before[1] == 1 and struct.unpack('!H', before[3:5])[0] > 0
     ctrl_4x.handle(dp.SET_PORT_ENABLED, b'\x05\x00')
-    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')[1]) == 1
+    _, after = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')
+    assert len(after) == 7
+    assert after[1] == 0
+    assert struct.unpack('!H', after[3:5])[0] == 0
 
 
 def test_port_info_out_of_range_is_nakd(scope_4x):
@@ -352,15 +407,14 @@ def test_dh_port_info_answers_on_both_2x_dew_ports(ctrl_2x):
     assert ctrl_2x.handle(dp.GET_DH_PORT_INFO, b'\x02')[0] == dp.NAK
 
 
-def test_manual_mode_sets_duty_cycle(ctrl_4x):
-    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x19')       # 25%
-    _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+def test_manual_mode_sets_duty_cycle(ctrl_2x):
+    ctrl_2x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x19')       # 25%
+    _, data = ctrl_2x.handle(dp.GET_DH_PORT_INFO, b'\x00')
     assert struct.unpack('!b', data[1:2])[0] == dp.DH_MANUAL
     assert data[2] == 25
-    # Draw scales with duty: 25% of 1800 mW = 450 mW, sent as 45 (x10 mW).
-    # Measured as very nearly linear on hardware: 174/364/557/744 at
-    # 25/50/75/100%.
-    assert struct.unpack('!H', data[3:5])[0] == 45
+    # Draw scales with duty: 25% of the measured 7440 mW ring, as 10 mW units.
+    # Very nearly linear on hardware: 174/364/557/744 at 25/50/75/100%.
+    assert struct.unpack('!H', data[3:5])[0] == 186
 
 
 def test_manual_duty_cycle_above_100_is_accepted_verbatim(ctrl_4x):

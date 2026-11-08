@@ -109,15 +109,26 @@ enum AUXCommands
 // have a variable-voltage port it does not have, and its real power output is
 // dropped because nothing classifies 0x11.
 //
-// The 4X is UNVERIFIED: this predicts dew 0x01-0x04 and power 0x11-0x14, but
-// how it distinguishes its variable-voltage port is unknown.
+// CONFIRMED on a 4X (2026-11-08), which reports 11 ports:
+//
+//     0x01-0x04  four dew heaters
+//     0x41       variable voltage -- the manual's "power port #1"
+//     0x12-0x14  three fixed 12V outputs, indexed 2..4 precisely because
+//                port #1 is the variable one and has its own category
+//     0x31-0x33  three USB ports, reporting 5000 mV
+//
+// SET_PORT_VOLTAGE is accepted only on 0x4x, and NAK'd on 0x1x and 0x3x,
+// which is what pins the variable port down. The USB ports' 5000 mV is what
+// identifies them. Category 0x2 has never been seen.
 #define PORTCTRL_CATEGORY(type) ((type) >> 4)
 #define PORTCTRL_INDEX(type)    ((type) & 0x0f)
 
 enum PortCtrlCategory
 {
-    PORTCTRL_CAT_DEW   = 0x0,
-    PORTCTRL_CAT_POWER = 0x1
+    PORTCTRL_CAT_DEW      = 0x0,   // 2X: 0x01-0x02   4X: 0x01-0x04
+    PORTCTRL_CAT_POWER    = 0x1,   // fixed 12V output
+    PORTCTRL_CAT_USB      = 0x3,   // 4X only: 0x31-0x33, reporting 5000 mV
+    PORTCTRL_CAT_VARIABLE = 0x4    // 4X only: 0x41, 3.0-11.0 V or 12.0 V
 };
 
 // Byte 1 of PORTCTRL_GET_DH_PORT_INFO, signed. Measured as a plain
