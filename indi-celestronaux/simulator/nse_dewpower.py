@@ -17,35 +17,42 @@ record them as verified against real hardware on 2026-08-20 -- a 3-port unit
 attached to a CGX. Byte orders are big-endian throughout, matching that
 driver's AUXCommand::getData()/setData().
 
-WHAT IS CONFIRMED vs ASSUMED
-----------------------------
-Confirmed by that driver (and so reproduced faithfully here):
-  * target address 0x17, the command bytes, and every response size
-  * port types are classified 0 = DC output, 1 = dew heater, 2 = variable
-  * GET_PORT_INFO on an *idle* port returns only the 1-byte port type; the
-    full 7-byte telemetry appears only while the port is drawing current.
-    This is reproduced deliberately -- it is a real quirk that previously
-    caused idle ports to be misclassified as DC.
-  * NAK (0xF0) is returned *in place of* the requested command byte, with one
-    data byte naming the rejected command, when a command does not apply to
-    the addressed port.
+VERIFIED AGAINST REAL HARDWARE (2026-11-08)
+-------------------------------------------
+Probed on Bob's Smart DewHeater Controller 2X (#94035, firmware 1.0) over the
+controller's own USB CDC port at 19200 baud, no flow control. Confirmed:
 
-ASSUMED, and flagged for confirmation against Bob's hardware:
-  * The ORDER of ports within the single flat index space. The manuals number
-    the 4X's *power* ports 1..4 (#1 variable, #2-4 fixed 12V) and its dew
-    ports 1..4 separately, but they say nothing about how the two groups are
-    interleaved in the AUX port index space. PORT_PROFILES below puts dew
-    ports first; if hardware disagrees, that table is the only thing to change.
-  * Whether the 4X's three USB ports appear in the index space at all. They
-    are omitted here -- the standalone driver counts USB ports but never
-    classifies any port as USB, which suggests they are not enumerated.
-  * GET_VERSION's 2 bytes are rendered as major.minor.
+  * 0x17 answers; GET_VERSION returns 2 bytes (01 00 = v1.0)
+  * GET_NUMBER_OF_PORTS = 3 for the 2X
+  * response sizes for GET_INPUT_POWER (6), GET_ENVIRONMENT (9),
+    GET_POWER_ENABLED (1), GET_EXT_CURRENT_LIMIT (4), SELF_HEATER_STATUS (1),
+    GET_LED_BRIGHTNESS (1), GET_DH_PORT_INFO (6)
+  * the idle-port quirk is real: an idle port returns ONLY the 1-byte type,
+    and the full 7-byte telemetry appears only while it draws current
+  * an out-of-range port index is NAK'd
+  * NAK (0xF0) replaces the requested command byte, carrying one data byte
+    naming the rejected command
+  * 10000 mA maximum current, matching the manual's 10 A / 120 W
+  * the dew point the controller reports agrees with the Magnus-Tetens
+    formula in dew_point_c() to 0.01 C
 
-Port counts come from the manuals in docs/:
-  2X (#94035): 2 dew heater ports + 1 fixed 12V power output        -> 3 ports
-  4X (#94036): 4 dew heater ports + 1 variable + 3 fixed 12V output -> 8 ports
-The 2X's 3 ports happen to match the "3-port unit" the protocol was verified
-against, which is a reassuring consistency check.
+CORRECTED BY THAT PROBE
+-----------------------
+  * PORT TYPE CODES are not 0/1/2 -- see the long note below. The standalone
+    driver's mapping is wrong, and on a 2X it drops the real power port.
+  * GET_HEATER_LEVEL (0x1B) is NAK'd by firmware 1.0, not supported.
+  * Defaults: LED brightness 0xFF, external current limit 8000 mA, both dew
+    ports resting in auto-above-dew-point at 0% duty with per-port aggression
+    levels (3 and 5, so it is genuinely per port and not a global setting).
+
+STILL UNVERIFIED
+----------------
+  * Everything about the 4X: its port count, type codes, and how its
+    variable-voltage port is identified over AUX. The '4x' profile is an
+    extrapolation -- probe one before trusting it.
+  * Whether the 4X's three USB ports are enumerated at all (omitted here).
+  * All the SET_* commands. Only read commands have been exercised on
+    hardware; nothing here has been confirmed to *change* anything.
 """
 
 import math
@@ -104,10 +111,50 @@ cmd_names = {
     NAK:                   'NAK',
 }
 
-# Port types, as classified by the standalone driver.
-PORT_DC       = 0
-PORT_DEW      = 1
-PORT_VARIABLE = 2
+# ---------------------------------------------------------------------------
+# PORT TYPE CODES
+#
+# Measured on Bob's Smart DewHeater Controller 2X (#94035, firmware 1.0) on
+# 2026-11-08, over the controller's own USB CDC port:
+#
+#   port 0 -> type 0x01     GET_DH_PORT_INFO answered
+#   port 1 -> type 0x02     GET_DH_PORT_INFO answered
+#   port 2 -> type 0x11     GET_DH_PORT_INFO NAK'd; the only port drawing
+#                           current (489 mW at 12197 mV -- it powers the mount)
+#
+# This does NOT match the mapping in INDI core's standalone driver, which
+# assumes 0 = DC, 1 = dew, 2 = variable and says in a comment that the mapping
+# "needs to be clarified from the protocol if different". It is different. On
+# this unit that driver reads port 1 as a variable-voltage port (the 2X has
+# none -- that is a 4X feature) and silently drops port 2 entirely, because
+# nothing classifies type 0x11. The dropped port is the one actually delivering
+# power. Do not copy that mapping into our driver.
+#
+# HYPOTHESIS that fits every observation: the type byte is
+#
+#       (category << 4) | one-based index within that category
+#
+# so 0x01/0x02 are dew heater ports 1 and 2, and 0x11 is power output port 1.
+# That gives the 2X exactly the 2 dew ports + 1 power output its manual
+# describes, and explains why DH_PORT_INFO is accepted on 0x01/0x02 and
+# refused on 0x11.
+#
+# Still UNVERIFIED: the 4X's codes. The hypothesis predicts dew 0x01-0x04 and
+# power 0x11-0x14, but how the 4X distinguishes its variable-voltage port
+# (power port #1 per the manual) is unknown -- it may be a third category, or
+# a flag, or not distinguished at all over AUX. Hence `variable` is an explicit
+# per-port flag in PORT_PROFILES below rather than being inferred from a code.
+# ---------------------------------------------------------------------------
+CAT_DEW   = 0x0
+CAT_POWER = 0x1
+
+
+def port_category(type_code):
+    return type_code >> 4
+
+
+def port_index(type_code):
+    return type_code & 0x0F
 
 # Dew heater modes, as reported in byte 1 of GET_DH_PORT_INFO (signed).
 DH_SHORTED            = -1
@@ -116,28 +163,35 @@ DH_AUTO_ABOVE_DEWPT   = 1
 DH_AUTO_ABOVE_AMBIENT = 2
 
 # Hardware limits from the manuals (both models): 13.8V max input, 120W / 10A.
+# MAX_CURRENT_MA is confirmed: the 2X reports 0x2710 = 10000 mA as its maximum
+# in GET_EXT_CURRENT_LIMIT, matching the manual's 10 A / 120 W ceiling.
 MAX_INPUT_MV   = 13800
 MAX_CURRENT_MA = 10000
 
-# (type, nominal_mV, idle_load_mW) per port. See the ASSUMED note above about
-# ordering; swapping these rows is all it takes to match real hardware.
+# Per port: (type_code, nominal_mV, idle_load_mW, aggression_C, variable)
 PORT_PROFILES = {
     # Smart DewHeater Controller 2X, #94035.
+    # VERIFIED against Bob's unit (firmware 1.0) on 2026-11-08, including the
+    # type codes, the per-port aggression levels, and which port draws current.
     '2x': [
-        (PORT_DEW,       12000, 1800),   # dew heater 1 -- a ring, drawing
-        (PORT_DEW,       12000,    0),   # dew heater 2 -- nothing plugged in
-        (PORT_DC,        12000, 6000),   # 12V output -- e.g. the mount
+        (0x01, 12000,   0, 3, False),   # dew heater 1 -- idle, aggression 3
+        (0x02, 12000,   0, 5, False),   # dew heater 2 -- idle, aggression 5
+        (0x11, 12197, 489, 0, False),   # 12V output -- powers the mount
     ],
     # Smart DewHeater and Power Controller 4X, #94036.
+    # NOT VERIFIED. Port count (4 dew + 4 power) is from the manual; the type
+    # codes are the hypothesis above extrapolated from the 2X, and the variable
+    # flag on power port #1 is from the manual rather than from the bus. Probe
+    # a real 4X with ./aux-probe.py before trusting any of this.
     '4x': [
-        (PORT_DEW,       12000, 1800),   # dew heater 1
-        (PORT_DEW,       12000, 2400),   # dew heater 2
-        (PORT_DEW,       12000,    0),   # dew heater 3 -- idle
-        (PORT_DEW,       12000,    0),   # dew heater 4 -- idle
-        (PORT_VARIABLE,  12000, 2500),   # power port #1, variable 3.0-11.0/12.0V
-        (PORT_DC,        12000, 6000),   # power port #2
-        (PORT_DC,        12000,    0),   # power port #3 -- idle
-        (PORT_DC,        12000,    0),   # power port #4 -- idle
+        (0x01, 12000, 1800, 5, False),  # dew heater 1
+        (0x02, 12000, 2400, 5, False),  # dew heater 2
+        (0x03, 12000,    0, 5, False),  # dew heater 3 -- idle
+        (0x04, 12000,    0, 5, False),  # dew heater 4 -- idle
+        (0x11, 12000, 2500, 0, True),   # power #1 -- variable 3.0-11.0/12.0V
+        (0x12, 12000, 6000, 0, False),  # power #2
+        (0x13, 12000,    0, 0, False),  # power #3 -- idle
+        (0x14, 12000,    0, 0, False),  # power #4 -- idle
     ],
 }
 
@@ -157,21 +211,28 @@ def dew_point_c(temp_c, humidity_pct):
 
 
 class Port:
-    def __init__(self, ptype, voltage_mV, load_mW):
-        self.type = ptype
+    def __init__(self, type_code, voltage_mV, load_mW, aggression_C=5,
+                 variable=False):
+        self.type = type_code
         self.enabled = True
         self.shorted = False
         self.voltage_mV = voltage_mV
         self.load_mW = load_mW
-        # Dew-heater-only state.
-        self.mode = DH_AUTO_ABOVE_DEWPT if ptype == PORT_DEW else DH_MANUAL
+        self.variable = variable
+        # Dew-heater-only state. Both of the 2X's dew ports were found in
+        # auto-above-dew-point mode at 0% duty, which is the idle resting state.
+        self.mode = DH_AUTO_ABOVE_DEWPT if self.is_dew else DH_MANUAL
         self.power_level = 0          # 0..100 %
-        self.aggression_C = 5         # degrees above the target to hold
+        self.aggression_C = aggression_C
         self.heater_temp_mC = None    # only present when a thermistor is fitted
 
     @property
+    def category(self):
+        return port_category(self.type)
+
+    @property
     def is_dew(self):
-        return self.type == PORT_DEW
+        return self.category == CAT_DEW
 
     def power_mW(self):
         """Instantaneous draw. Zero unless enabled and something is plugged in."""
@@ -198,8 +259,8 @@ class DewPowerController:
     the caller should treat the way the bus does: silence.
     """
 
-    #: 2 bytes, rendered major.minor
-    VERSION = (1, 7)
+    #: 2 bytes, rendered major.minor. Bob's 2X reports 1.0.
+    VERSION = (1, 0)
 
     def __init__(self, model='4x'):
         model = str(model).lower()
@@ -207,18 +268,20 @@ class DewPowerController:
             raise ValueError('unknown dew/power controller model %r (want one of %s)'
                              % (model, ', '.join(sorted(PORT_PROFILES))))
         self.model = model
-        self.ports = [Port(t, v, l) for (t, v, l) in PORT_PROFILES[model]]
+        self.ports = [Port(*spec) for spec in PORT_PROFILES[model]]
         self.power_enabled = True
-        self.led_brightness = 128
+        # Observed defaults on the real 2X: LED at full brightness, self heater
+        # off, external current limit 8000 mA against a 10000 mA maximum.
+        self.led_brightness = 0xFF
         self.self_heater = False
-        self.ext_current_limit_mA = 5000
+        self.ext_current_limit_mA = 8000
         self.fuse_blown = False
         self.log = []
 
-        # Environment sensor. Starts at a plausible damp-evening state and
-        # drifts in tick() so repeated reads are not identical.
-        self.ambient_C = 8.0
-        self.humidity = 72.0
+        # Environment sensor. Seeded near what the real 2X reported indoors
+        # (22.96 C / 51% RH) and drifted in tick() so repeated reads differ.
+        self.ambient_C = 23.0
+        self.humidity = 51.0
         self._t = 0.0
 
         self.cmd_handlers = {
@@ -268,8 +331,8 @@ class DewPowerController:
         """Drift the environment and run the auto-dew control loop."""
         self._t += interval
         # Slow, bounded wander -- a couple of degrees over several minutes.
-        self.ambient_C = 8.0 + 2.0 * math.sin(self._t / 180.0)
-        self.humidity = 72.0 + 8.0 * math.sin(self._t / 240.0)
+        self.ambient_C = 23.0 + 2.0 * math.sin(self._t / 180.0)
+        self.humidity = 51.0 + 8.0 * math.sin(self._t / 240.0)
 
         dp = dew_point_c(self.ambient_C, self.humidity)
         for p in self.ports:
@@ -299,7 +362,7 @@ class DewPowerController:
 
     def _get_input_power(self, data):
         """<0:1 voltage mV><2:3 current mA><4 voltage status><5 overcurrent>"""
-        voltage_mV = 12400
+        voltage_mV = 12197          # what Bob's unit reported on a 12V supply
         current_mA = self.total_current_mA()
         if voltage_mV > MAX_INPUT_MV:
             v_status = 1            # over voltage
@@ -388,7 +451,7 @@ class DewPowerController:
         p = self._port(data)
         if p is None or len(data) < 3:
             return _NAK
-        if p.type != PORT_VARIABLE:
+        if not p.variable:
             return _NAK
         mV = struct.unpack('!H', data[1:3])[0]
         # Manual: 3.0-11.0V in steps, or 12.0V.
@@ -436,12 +499,15 @@ class DewPowerController:
         return bytes((1 if self.self_heater else 0,))
 
     def _get_heater_level(self, data):
-        """Aggregate heater level, 0-255."""
-        dew = [p for p in self.ports if p.is_dew]
-        if not dew:
-            return bytes((0,))
-        avg = sum(p.power_level for p in dew) / float(len(dew))
-        return bytes((int(min(avg * 255 / 100.0, 255)),))
+        """
+        Not supported by the firmware we have seen.
+
+        The real 2X (firmware 1.0) NAKs 0x1B outright, so the aggregate heater
+        level has to be derived from the per-port duty cycles in
+        GET_DH_PORT_INFO instead. If a 4X with newer firmware does answer it,
+        implement it then -- do not guess at a payload we have never observed.
+        """
+        return _NAK
 
     def _set_led_brightness(self, data):
         if len(data) >= 1:

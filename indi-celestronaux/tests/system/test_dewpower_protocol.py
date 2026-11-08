@@ -111,20 +111,48 @@ def ctrl_2x():
 # --------------------------------------------------------------------------- #
 # Model profiles
 # --------------------------------------------------------------------------- #
-def test_2x_has_two_dew_ports_and_one_dc_port(ctrl_2x):
-    types = [p.type for p in ctrl_2x.ports]
-    assert len(types) == 3, 'the 2X manual describes 2 dew + 1 power output'
-    assert types.count(dp.PORT_DEW) == 2
-    assert types.count(dp.PORT_DC) == 1
-    assert dp.PORT_VARIABLE not in types, 'the 2X has no variable port'
+def test_2x_port_type_codes_match_bobs_hardware(ctrl_2x):
+    """
+    Measured on Bob's 2X (firmware 1.0) on 2026-11-08. These exact bytes came
+    off the wire, so this test is a hardware contract, not a guess:
+        port 0 -> 0x01, port 1 -> 0x02, port 2 -> 0x11
+    """
+    assert [p.type for p in ctrl_2x.ports] == [0x01, 0x02, 0x11]
+
+
+def test_2x_has_two_dew_ports_and_one_power_port(ctrl_2x):
+    cats = [p.category for p in ctrl_2x.ports]
+    assert len(cats) == 3, 'the 2X manual describes 2 dew + 1 power output'
+    assert cats.count(dp.CAT_DEW) == 2
+    assert cats.count(dp.CAT_POWER) == 1
+    assert not any(p.variable for p in ctrl_2x.ports), 'the 2X has no variable port'
+
+
+def test_type_code_splits_into_category_and_index(ctrl_2x):
+    """The (category << 4) | index hypothesis that fits the measured bytes."""
+    assert [dp.port_category(p.type) for p in ctrl_2x.ports] == [0, 0, 1]
+    assert [dp.port_index(p.type) for p in ctrl_2x.ports] == [1, 2, 1]
+
+
+def test_2x_power_port_is_the_one_drawing_current(ctrl_2x):
+    """On the real unit only port 2 drew current -- it powers the mount."""
+    assert ctrl_2x.ports[2].is_active()
+    assert not ctrl_2x.ports[0].is_active()
+    assert not ctrl_2x.ports[1].is_active()
+
+
+def test_2x_aggression_is_per_port(ctrl_2x):
+    """The real unit reported 3 on port 0 and 5 on port 1, so it is per port."""
+    assert ctrl_2x.ports[0].aggression_C == 3
+    assert ctrl_2x.ports[1].aggression_C == 5
 
 
 def test_4x_has_four_dew_four_power_one_variable(ctrl_4x):
-    types = [p.type for p in ctrl_4x.ports]
-    assert len(types) == 8, 'the 4X manual describes 4 dew + 4 power outputs'
-    assert types.count(dp.PORT_DEW) == 4
-    assert types.count(dp.PORT_VARIABLE) == 1, 'power port #1 is the variable one'
-    assert types.count(dp.PORT_DC) == 3
+    cats = [p.category for p in ctrl_4x.ports]
+    assert len(cats) == 8, 'the 4X manual describes 4 dew + 4 power outputs'
+    assert cats.count(dp.CAT_DEW) == 4
+    assert cats.count(dp.CAT_POWER) == 4
+    assert sum(p.variable for p in ctrl_4x.ports) == 1, 'power #1 is variable'
 
 
 def test_unknown_model_rejected():
@@ -160,7 +188,6 @@ def test_absent_controller_answers_nothing(monkeypatch):
     (dp.GET_POWER_ENABLED,     b'',       1),
     (dp.GET_EXT_CURRENT_LIMIT, b'',       4),
     (dp.SELF_HEATER_STATUS,    b'',       1),
-    (dp.GET_HEATER_LEVEL,      b'',       1),
     (dp.GET_LED_BRIGHTNESS,    b'',       1),
     (dp.SET_PORT_ENABLED,      b'\x00\x01', 0),
     (dp.DH_ENABLE_MANUAL,      b'\x00\x32', 0),
@@ -175,7 +202,26 @@ def test_response_sizes_match_driver_expectations(scope_4x, cmd, data, size):
 
 
 def test_get_version_is_two_bytes(ctrl_4x):
-    assert ctrl_4x.handle(dp.GET_VERSION, b'') == (dp.GET_VERSION, b'\x01\x07')
+    """Bob's 2X reported 01 00 -- two bytes, v1.0."""
+    assert ctrl_4x.handle(dp.GET_VERSION, b'') == (dp.GET_VERSION, b'\x01\x00')
+
+
+def test_get_heater_level_is_nakd(ctrl_4x):
+    """
+    Firmware 1.0 NAKs 0x1B. The aggregate heater level has to be derived from
+    the per-port duty cycles instead, so the driver must not depend on it.
+    """
+    assert ctrl_4x.handle(dp.GET_HEATER_LEVEL, b'') == (
+        dp.NAK, bytes((dp.GET_HEATER_LEVEL,)))
+
+
+def test_observed_hardware_defaults(ctrl_2x):
+    assert ctrl_2x.handle(dp.GET_LED_BRIGHTNESS, b'')[1] == b'\xff'
+    assert ctrl_2x.handle(dp.SELF_HEATER_STATUS, b'')[1] == b'\x00'
+    assert ctrl_2x.handle(dp.GET_POWER_ENABLED, b'')[1] == b'\x01'
+    limit, maximum = struct.unpack('!HH',
+                                   ctrl_2x.handle(dp.GET_EXT_CURRENT_LIMIT, b'')[1])
+    assert (limit, maximum) == (8000, 10000)
 
 
 def test_number_of_ports_matches_profile(scope_4x):
@@ -192,7 +238,7 @@ def test_active_port_returns_full_telemetry(ctrl_4x):
     assert len(data) == 7
     ptype, enabled, shorted = data[0], data[1], data[2]
     power_mW, voltage_mV = struct.unpack('!HH', data[3:7])
-    assert ptype == dp.PORT_DEW
+    assert dp.port_category(ptype) == dp.CAT_DEW
     assert enabled == 1 and shorted == 0
     assert power_mW == 1800
     assert voltage_mV == 12000
@@ -206,7 +252,7 @@ def test_idle_port_returns_only_its_type(ctrl_4x):
     """
     _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x02')   # dew heater 3, no load
     assert len(data) == 1
-    assert data[0] == dp.PORT_DEW
+    assert dp.port_category(data[0]) == dp.CAT_DEW
 
 
 def test_disabling_a_port_makes_it_idle(ctrl_4x):
@@ -229,17 +275,31 @@ def test_dh_port_info_layout(ctrl_4x):
     ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x01\x07')     # auto above dew point
     _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
     assert len(data) >= 6
-    assert data[0] == dp.PORT_DEW
+    assert dp.port_category(data[0]) == dp.CAT_DEW
     assert struct.unpack('!b', data[1:2])[0] == dp.DH_AUTO_ABOVE_DEWPT
     assert 0 <= data[2] <= 100
     assert data[5] == 7, 'aggression level should round-trip'
 
 
-def test_dh_port_info_nakd_on_non_dew_port(ctrl_4x):
+def test_dh_port_info_nakd_on_power_port(ctrl_4x):
     """Port 5 is a fixed 12V output on the 4X profile."""
-    assert ctrl_4x.ports[5].type == dp.PORT_DC
+    assert ctrl_4x.ports[5].category == dp.CAT_POWER
     assert ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x05') == (
         dp.NAK, bytes((dp.GET_DH_PORT_INFO,)))
+
+
+def test_dh_port_info_answers_on_both_2x_dew_ports(ctrl_2x):
+    """
+    On the real 2X, GET_DH_PORT_INFO was answered for ports 0 AND 1 and NAK'd
+    only for port 2. That is the strongest evidence that 0x01 and 0x02 are both
+    dew ports rather than 0x02 being a variable-voltage port as the standalone
+    driver assumes.
+    """
+    for port in (0, 1):
+        cmd, data = ctrl_2x.handle(dp.GET_DH_PORT_INFO, bytes((port,)))
+        assert cmd == dp.GET_DH_PORT_INFO, 'port %d should answer' % port
+        assert len(data) >= 6
+    assert ctrl_2x.handle(dp.GET_DH_PORT_INFO, b'\x02')[0] == dp.NAK
 
 
 def test_manual_mode_sets_duty_cycle(ctrl_4x):
@@ -306,7 +366,7 @@ def test_variable_port_rejects_out_of_range_voltage(ctrl_4x):
 
 
 def test_setting_voltage_on_fixed_port_is_nakd(ctrl_4x):
-    assert ctrl_4x.ports[5].type == dp.PORT_DC
+    assert not ctrl_4x.ports[5].variable
     assert ctrl_4x.handle(dp.SET_PORT_VOLTAGE,
                           b'\x05' + struct.pack('!H', 5000))[0] == dp.NAK
 
@@ -394,20 +454,23 @@ def test_self_heater_round_trips(ctrl_4x):
     assert ctrl_4x.handle(dp.SELF_HEATER_STATUS, b'')[1] == b'\x01'
 
 
-def test_heater_level_tracks_duty_cycles(ctrl_4x):
+def test_duty_cycles_are_readable_per_port(ctrl_4x):
+    """
+    GET_HEATER_LEVEL is unavailable on real firmware, so an aggregate has to
+    come from the per-port duty cycles. Check they are all reachable.
+    """
     for port in range(4):
         ctrl_4x.handle(dp.DH_ENABLE_MANUAL, bytes((port, 100)))
-    assert ctrl_4x.handle(dp.GET_HEATER_LEVEL, b'')[1] == b'\xff'
-    for port in range(4):
-        ctrl_4x.handle(dp.DH_ENABLE_MANUAL, bytes((port, 0)))
-    assert ctrl_4x.handle(dp.GET_HEATER_LEVEL, b'')[1] == b'\x00'
+    levels = [ctrl_4x.handle(dp.GET_DH_PORT_INFO, bytes((p,)))[1][2]
+              for p in range(4)]
+    assert levels == [100, 100, 100, 100]
 
 
 def test_factory_reset_restores_defaults(ctrl_4x):
     ctrl_4x.handle(dp.SET_LED_BRIGHTNESS, b'\x01')
     ctrl_4x.handle(dp.SET_PORT_ENABLED, b'\x00\x00')
     ctrl_4x.handle(dp.FACTORY_RESET, b'')
-    assert ctrl_4x.led_brightness == 128
+    assert ctrl_4x.led_brightness == 0xFF
     assert ctrl_4x.ports[0].enabled
 
 
