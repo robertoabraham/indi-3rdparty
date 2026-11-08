@@ -8,6 +8,8 @@ import curses
 from collections import deque
 import binascii
 
+import nse_dewpower
+
 # ID tables
 targets={'ANY':0x00,
          'MB' :0x01,
@@ -16,6 +18,7 @@ targets={'ANY':0x00,
          'HC+':0x0d,
          'AZM':0x10,
          'ALT':0x11,
+         'DEW':0x17,
          'APP':0x20,
          'GPS':0xb0,
          'UKN2': 0xb4,
@@ -226,6 +229,13 @@ class NexStarScope:
         self.charge=False
         self.cordwrap = False
         self.cordwrap_pos = 0
+        # Smart DewHeater/Power Controller on AUX address 0x17, or None when
+        # $NSE_DEW_MODEL=none, to emulate a mount with no controller attached.
+        # Note this cannot live in _other_handlers: that table is keyed on the
+        # command byte alone and shared by every non-motor target, and the
+        # controller's commands collide with existing entries (0x10, 0x18,
+        # 0xfe). Dispatch for it is by destination, in handle_cmd below.
+        self.dewpower = nse_dewpower.from_env()
         self._other_handlers = {
             0x10: NexStarScope.cmd_0x10,
             0x18: NexStarScope.cmd_0x18,
@@ -616,6 +626,8 @@ class NexStarScope:
             sys.stdout.flush()
 
     def tick(self, interval):
+        if self.dewpower is not None :
+            self.dewpower.tick(interval)
         eps=1e-6 # 0.1" precission
         maxrate = 5/360
         if self.last_cmd=='GOTO_FAST' :
@@ -703,7 +715,19 @@ class NexStarScope:
             self.print_msg("Wrong checksum. Ignoring.")
         else :
             resp = b';' + cmd
-            if t in (0x10, 0x11):
+            # The dew/power controller is dispatched on destination, not on
+            # command byte: its commands overlap those of the other non-motor
+            # targets (0x10, 0x18, 0xfe). It also picks its own response
+            # command byte, so it can answer NAK (0xf0) instead of the request.
+            # The test is on destination alone -- never "and self.dewpower" --
+            # because with no controller attached 0x17 must fall silent rather
+            # than drop through to _other_handlers, where fw_version would
+            # answer for it and fabricate a device that is not there.
+            dew = (t == targets['DEW'])
+            handlers = None
+            if dew :
+                s = nse_dewpower.describe(c, d)
+            elif t in (0x10, 0x11):
                 handlers=self._mc_handlers
                 try :
                     s=('%s[%s] ' % (trg_names[t], cmd_names[c])) + ''.join('%02x' % b for b in d)
@@ -716,7 +740,15 @@ class NexStarScope:
                 except KeyError :
                     s=('%02x[%02x]' % (t,c)) + ' ' + ''.join('%02x' % b for b in d)
             sr=b''
-            if c in handlers :
+            if dew :
+                result = self.dewpower.handle(c, d) if self.dewpower else None
+                if result is None :
+                    s = '** ' + s
+                else :
+                    rc, sr = result
+                    r = bytes((len(sr)+3,t,f,rc)) + sr
+                    resp += b';' + r + bytes((make_checksum(r),))
+            elif c in handlers :
                 r = handlers[c](self,d,f,t)
                 sr = r
                 r = bytes((len(r)+3,t,f,c)) + r
