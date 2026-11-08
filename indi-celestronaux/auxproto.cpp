@@ -195,7 +195,59 @@ AUXCommand::AUXCommand(AUXCommands command, AUXTargets source, AUXTargets destin
 /////////////////////////////////////////////////////////////////////////////////////
 const char * AUXCommand::commandName(AUXCommands command) const
 {
-    if (m_Source == GPS || m_Destination == GPS)
+    if (m_Source == DEW_POWER_CTRL || m_Destination == DEW_POWER_CTRL)
+    {
+        switch (command)
+        {
+            case PORTCTRL_GET_INPUT_POWER:
+                return "PORTCTRL_GET_INPUT_POWER";
+            case PORTCTRL_SET_POWER_ENABLED:
+                return "PORTCTRL_SET_POWER_ENABLED";
+            case PORTCTRL_GET_POWER_ENABLED:
+                return "PORTCTRL_GET_POWER_ENABLED";
+            case PORTCTRL_SET_EXT_CURRENT_LIMIT:
+                return "PORTCTRL_SET_EXT_CURRENT_LIMIT";
+            case PORTCTRL_GET_EXT_CURRENT_LIMIT:
+                return "PORTCTRL_GET_EXT_CURRENT_LIMIT";
+            case PORTCTRL_GET_NUMBER_OF_PORTS:
+                return "PORTCTRL_GET_NUMBER_OF_PORTS";
+            case PORTCTRL_GET_PORT_INFO:
+                return "PORTCTRL_GET_PORT_INFO";
+            case PORTCTRL_GET_DH_PORT_INFO:
+                return "PORTCTRL_GET_DH_PORT_INFO";
+            case PORTCTRL_RESET_FUSE:
+                return "PORTCTRL_RESET_FUSE";
+            case PORTCTRL_SET_PORT_ENABLED:
+                return "PORTCTRL_SET_PORT_ENABLED";
+            case PORTCTRL_SET_PORT_VOLTAGE:
+                return "PORTCTRL_SET_PORT_VOLTAGE";
+            case PORTCTRL_DH_ENABLE_AUTO:
+                return "PORTCTRL_DH_ENABLE_AUTO";
+            case PORTCTRL_DH_ENABLE_MANUAL:
+                return "PORTCTRL_DH_ENABLE_MANUAL";
+            case PORTCTRL_GET_ENVIRONMENT:
+                return "PORTCTRL_GET_ENVIRONMENT";
+            case PORTCTRL_ENABLE_SELF_HEATER:
+                return "PORTCTRL_ENABLE_SELF_HEATER";
+            case PORTCTRL_SELF_HEATER_STATUS:
+                return "PORTCTRL_SELF_HEATER_STATUS";
+            case PORTCTRL_GET_HEATER_LEVEL:
+                return "PORTCTRL_GET_HEATER_LEVEL";
+            case PORTCTRL_SET_LED_BRIGHTNESS:
+                return "PORTCTRL_SET_LED_BRIGHTNESS";
+            case PORTCTRL_GET_LED_BRIGHTNESS:
+                return "PORTCTRL_GET_LED_BRIGHTNESS";
+            case PORTCTRL_FACTORY_RESET:
+                return "PORTCTRL_FACTORY_RESET";
+            case PORTCTRL_NAK:
+                return "PORTCTRL_NAK";
+            case GET_VER:
+                return "PORTCTRL_GET_VERSION";
+            default :
+                return nullptr;
+        }
+    }
+    else if (m_Source == GPS || m_Destination == GPS)
     {
         switch (command)
         {
@@ -282,7 +334,53 @@ const char * AUXCommand::commandName(AUXCommands command) const
 /////////////////////////////////////////////////////////////////////////////////////
 int AUXCommand::responseDataSize()
 {
-    if (m_Source == GPS || m_Destination == GPS)
+    if (m_Source == DEW_POWER_CTRL || m_Destination == DEW_POWER_CTRL)
+    {
+        // Sizes measured on a 2X (firmware 1.0) on 2026-11-08.
+        switch (m_Command)
+        {
+            case PORTCTRL_GET_ENVIRONMENT:
+                return 9;    // <0:3 ambient mC><4:7 dew point mC><8 humidity>
+            case PORTCTRL_GET_PORT_INFO:
+                // 7 while the port draws current, but an IDLE port replies
+                // with only its 1-byte type. Report the short form: it is the
+                // normal state at connect, and the reader must cope with both.
+                return 1;
+            case PORTCTRL_GET_INPUT_POWER:
+                return 6;    // <0:1 mV><2:3 mA><4 voltage status><5 overcurrent>
+            case PORTCTRL_GET_DH_PORT_INFO:
+                return 6;    // (+4 more when a thermistor is fitted)
+            case PORTCTRL_GET_EXT_CURRENT_LIMIT:
+                return 4;    // <0:1 limit mA><2:3 maximum mA>
+            case GET_VER:
+                // 0xfe, same byte as the mount's GET_VER, but the controller
+                // answers with 2 bytes where a motor controller sends 4.
+                return 2;
+            case PORTCTRL_GET_NUMBER_OF_PORTS:
+            case PORTCTRL_GET_POWER_ENABLED:
+            case PORTCTRL_SELF_HEATER_STATUS:
+            case PORTCTRL_GET_LED_BRIGHTNESS:
+            case PORTCTRL_NAK:
+                return 1;
+            case PORTCTRL_SET_POWER_ENABLED:
+            case PORTCTRL_SET_EXT_CURRENT_LIMIT:
+            case PORTCTRL_RESET_FUSE:
+            case PORTCTRL_SET_PORT_ENABLED:
+            case PORTCTRL_SET_PORT_VOLTAGE:
+            case PORTCTRL_DH_ENABLE_AUTO:
+            case PORTCTRL_DH_ENABLE_MANUAL:
+            case PORTCTRL_ENABLE_SELF_HEATER:
+            case PORTCTRL_SET_LED_BRIGHTNESS:
+            case PORTCTRL_FACTORY_RESET:
+                return 0;
+            case PORTCTRL_GET_HEATER_LEVEL:
+                // NAK'd by 2X firmware 1.0 -- never answered, so no size.
+                return -1;
+            default :
+                return -1;
+        }
+    }
+    else if (m_Source == GPS || m_Destination == GPS)
     {
         switch (m_Command)
         {
@@ -372,6 +470,8 @@ const char * AUXCommand::moduleName(AUXTargets n)
             return "GPS";
         case FOCUS :
             return "FOCUS";
+        case DEW_POWER_CTRL :
+            return "DEWPOWER";
         case WiFi:
             return "WiFi";
         case BAT :

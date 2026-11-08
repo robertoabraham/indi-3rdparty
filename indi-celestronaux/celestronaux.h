@@ -28,6 +28,8 @@
 #include <indicom.h>
 #include <indiguiderinterface.h>
 #include <indifocuserinterface.h>
+#include <indipowerinterface.h>
+#include <indiweatherinterface.h>
 #include <inditelescope.h>
 #include <indielapsedtimer.h>
 #include <inditimer.h>
@@ -37,6 +39,7 @@
 #include <indipropertyswitch.h>
 #include <indipropertynumber.h>
 #include <indipropertytext.h>
+#include <indipropertylight.h>
 #include <pid.h>
 #include <termios.h>
 
@@ -47,6 +50,8 @@ class CelestronAUX :
     public INDI::Telescope,
     public INDI::GuiderInterface,
     public INDI::FocuserInterface,
+    public INDI::PowerInterface,
+    public INDI::WeatherInterface,
     public INDI::AlignmentSubsystem::AlignmentSubsystemForDrivers
 {
     public:
@@ -536,6 +541,116 @@ class CelestronAUX :
         // Coord Wrap
         static constexpr const char *CORDWRAP_TAB {"Coord Wrap"};
         static constexpr const char *MOUNTINFO_TAB {"Mount Info"};
+        static constexpr const char *ENVIRONMENT_TAB {"Environment"};
+
+        ///////////////////////////////////////////////////////////////////////
+        /// Smart DewHeater & Power Controller, AUX target DEW_POWER_CTRL
+        ///
+        /// Detected the same way as the focuser: a GET_VERSION probe that is
+        /// simply allowed to time out when nothing is there. See
+        /// detectDewPower(). Protocol details, and which parts are measured
+        /// rather than assumed, are documented in auxproto.h.
+        ///////////////////////////////////////////////////////////////////////
+    private:
+        using PI = INDI::PowerInterface;
+        using WI = INDI::WeatherInterface;
+
+        /// One entry per AUX port the controller reports, in bus order.
+        struct DewPowerPort
+        {
+            uint8_t type {0};           ///< raw type byte, e.g. 0x01, 0x11
+            bool enabled {true};
+            bool shorted {false};
+            uint16_t power_mW {0};
+            uint16_t voltage_mV {0};
+            // Dew ports only.
+            bool autoMode {false};
+            uint8_t dutyCycle {0};      ///< 0-100, though hardware does not clamp
+            uint8_t aggression_C {5};   ///< degrees above dew point to hold
+            /// Index of this port within its INDI interface collection, since
+            /// PowerInterface numbers dew and power channels separately while
+            /// the bus uses one flat index space.
+            size_t indiIndex {0};
+
+            uint8_t category() const
+            {
+                return PORTCTRL_CATEGORY(type);
+            }
+            bool isDew() const
+            {
+                return category() == PORTCTRL_CAT_DEW;
+            }
+        };
+
+        bool detectDewPower();
+        bool getDewPowerPortInfo(uint8_t port);
+        bool getDewHeaterPortInfo(uint8_t port);
+        bool getDewPowerInputPower();
+        bool getDewPowerLEDBrightness();
+        bool setDewPowerPortEnabled(uint8_t port, bool enabled);
+        bool setDewHeaterManual(uint8_t port, uint8_t dutyCycle);
+        bool setDewHeaterAuto(uint8_t port, uint8_t aggression_C);
+        bool setDewPowerLEDBrightness(uint8_t brightness);
+        /// Refresh everything the Power tab shows. Called from TimerHit().
+        void pollDewPower();
+        /// Map an INDI dew/power channel index back to a bus port index.
+        int busPortForDewChannel(size_t channel) const;
+        int busPortForPowerChannel(size_t channel) const;
+
+        // INDI::PowerInterface
+        bool SetPowerPort(size_t port, bool enabled) override;
+        bool SetDewPort(size_t port, bool enabled, double dutyCycle) override;
+        bool SetVariablePort(size_t port, bool enabled, double voltage) override;
+        bool SetLEDEnabled(bool enabled) override;
+        bool SetAutoDewEnabled(size_t port, bool enabled) override;
+
+        // INDI::WeatherInterface
+        IPState updateWeather() override;
+
+        bool m_HasDewPower {false};
+        uint8_t m_DewPowerVersion[4] {0, 0, 0, 0};
+        uint8_t m_NumDewPowerPorts {0};
+        std::vector<DewPowerPort> m_DewPowerPorts;
+        /// Bus port indices by category, in the order INDI numbers them.
+        std::vector<uint8_t> m_DewChannelPorts;
+        std::vector<uint8_t> m_PowerChannelPorts;
+
+        /// GET_PORT_INFO and GET_DH_PORT_INFO replies do not echo the port
+        /// index, so remember which one we asked about. Reads are synchronous
+        /// (send then immediately read), so a single slot is enough.
+        uint8_t m_DewPowerPortInFlight {0};
+
+        uint16_t m_DewPowerVoltage_mV {0};
+        uint16_t m_DewPowerCurrent_mA {0};
+        int8_t m_DewPowerVoltageStatus {0};
+        uint8_t m_DewPowerOvercurrent {0};
+        uint8_t m_DewPowerLEDBrightness {0xff};
+        bool m_DewPowerEnvironmentValid {false};
+        double m_DewPowerAmbient_C {0};
+        double m_DewPowerDewPoint_C {0};
+        double m_DewPowerHumidity {0};
+
+        /// Input-power alerts, which PowerInterface has no slot for.
+        INDI::PropertyLight PowerStatusLP {3};
+        enum
+        {
+            POWER_STATUS_OVERCURRENT,
+            POWER_STATUS_UNDERVOLTAGE,
+            POWER_STATUS_OVERVOLTAGE
+        };
+
+        /// Per-dew-port aggression, which PowerInterface's auto-dew switch
+        /// cannot express on its own.
+        INDI::PropertyNumber DewAggressionNP {0};
+
+        /// The controller does not answer PORTCTRL_GET_HEATER_LEVEL on the
+        /// firmware we have seen, so there is nothing to poll for it.
+        static constexpr uint8_t DEW_DUTY_MAX {100};
+
+        /// Polling a 3-port 2X costs about eight AUX round-trips, and none of
+        /// this telemetry changes quickly, so keep it well clear of tracking.
+        static constexpr time_t DEWPOWER_POLL_SECONDS {5};
+        struct timeval m_LastDewPowerUpdate {0, 0};
         // Track modes
         static constexpr uint16_t AUX_STOP {0x0000};
         static constexpr uint16_t AUX_SIDEREAL {0xffff};

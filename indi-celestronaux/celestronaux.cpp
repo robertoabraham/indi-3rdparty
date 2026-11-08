@@ -63,7 +63,7 @@ double anglediff(double a, double b)
 ///
 /////////////////////////////////////////////////////////////////////////////////////
 CelestronAUX::CelestronAUX()
-    : GI(this), FI(this),
+    : GI(this), FI(this), PI(this), WI(this),
       ScopeStatus(IDLE),
       DBG_CAUX(INDI::Logger::getInstance().addDebugLevel("AUX", "CAUX")),
       DBG_SERIAL(INDI::Logger::getInstance().addDebugLevel("Serial", "CSER"))
@@ -406,6 +406,23 @@ bool CelestronAUX::initProperties()
 
     FI::initProperties(FOCUS_TAB);
 
+    /////////////////////////////////////////////////////////////////////////////////////
+    /// Smart DewHeater & Power Controller
+    ///
+    /// Only the parts that do not depend on the port layout are set up here.
+    /// PI::initProperties() needs the port counts, so it is deferred to
+    /// detectDewPower(), which runs once we are talking to the hardware.
+    /////////////////////////////////////////////////////////////////////////////////////
+    WI::initProperties(ENVIRONMENT_TAB, ENVIRONMENT_TAB);
+    addParameter("WEATHER_AMBIENT_TEMPERATURE", "Ambient (C)", -40, 50, 15);
+    addParameter("WEATHER_DEW_POINT", "Dew point (C)", -40, 50, 15);
+    addParameter("WEATHER_HUMIDITY", "Humidity (%)", 0, 100, 15);
+
+    PowerStatusLP[POWER_STATUS_OVERCURRENT].fill("OVERCURRENT", "Over current", IPS_IDLE);
+    PowerStatusLP[POWER_STATUS_UNDERVOLTAGE].fill("UNDERVOLTAGE", "Under voltage", IPS_IDLE);
+    PowerStatusLP[POWER_STATUS_OVERVOLTAGE].fill("OVERVOLTAGE", "Over voltage", IPS_IDLE);
+    PowerStatusLP.fill(getDeviceName(), "POWER_STATUS", "Input power", POWER_TAB, IPS_IDLE);
+
     // override some default initialization values
     FocusMaxPosNP[0].setMax(60000);
     FocusMaxPosNP[0].setMin(0);
@@ -734,6 +751,19 @@ bool CelestronAUX::updateProperties()
 
         }
 
+        // Smart DewHeater & Power Controller. Probing is cheap and its
+        // failure mode is a timeout, so a mount with no controller sees
+        // exactly the behaviour it saw before this existed.
+        if (detectDewPower())
+        {
+            PI::updateProperties();
+            WI::updateProperties();
+            defineProperty(PowerStatusLP);
+            if (DewAggressionNP.count())
+                defineProperty(DewAggressionNP);
+            pollDewPower();
+        }
+
         // When no HC is attached, the following three commands needs to be send
         // to the motor controller (MC): MC_SET_POSITION, MC_SET_CORDWRAP_POSITION
         // and MC_CORDWRAP_ON. These three commands are also send by the HC
@@ -816,6 +846,16 @@ bool CelestronAUX::updateProperties()
         deleteProperty(FirmwareTP);
 
         FI::updateProperties();
+
+        if (m_HasDewPower)
+        {
+            deleteProperty(PowerStatusLP);
+            if (DewAggressionNP.count())
+                deleteProperty(DewAggressionNP);
+            PI::updateProperties();
+            WI::updateProperties();
+            m_HasDewPower = false;
+        }
     }
 
     return true;
@@ -828,6 +868,12 @@ bool CelestronAUX::saveConfigItems(FILE *fp)
 {
     INDI::Telescope::saveConfigItems(fp);
     SaveAlignmentConfigProperties(fp);
+
+    if (m_HasDewPower)
+    {
+        PI::saveConfigItems(fp);
+        WI::saveConfigItems(fp);
+    }
 
     PortTypeSP.save(fp);
     CordWrapToggleSP.save(fp);
@@ -891,6 +937,37 @@ bool CelestronAUX::ISNewNumber(const char *dev, const char *name, double values[
     // Check guider interface
     if (GI::processNumber(dev, name, values, names, n))
         return true;
+    // Check dew/power controller interfaces
+    if (PI::processNumber(dev, name, values, names, n))
+        return true;
+    if (WI::processNumber(dev, name, values, names, n))
+        return true;
+
+    if (m_HasDewPower && dev && !strcmp(dev, getDeviceName()) &&
+            DewAggressionNP.isNameMatch(name))
+    {
+        // Writing the aggression re-arms auto mode on that port, since
+        // PORTCTRL_DH_ENABLE_AUTO is the only command that carries the value.
+        bool allOk = true;
+        for (int i = 0; i < n; i++)
+        {
+            auto widget = DewAggressionNP.findWidgetByName(names[i]);
+            if (!widget)
+                continue;
+            size_t channel = widget - &DewAggressionNP[0];
+            int busPort = busPortForDewChannel(channel);
+            if (busPort < 0)
+                continue;
+            auto aggression = static_cast<uint8_t>(std::round(std::min(std::max(values[i], 0.0), 20.0)));
+            if (setDewHeaterAuto(busPort, aggression))
+                widget->setValue(aggression);
+            else
+                allOk = false;
+        }
+        DewAggressionNP.setState(allOk ? IPS_OK : IPS_ALERT);
+        DewAggressionNP.apply();
+        return true;
+    }
 
     if (strcmp(dev, getDeviceName()) == 0)
     {
@@ -1007,6 +1084,10 @@ bool CelestronAUX::ISNewNumber(const char *dev, const char *name, double values[
 /////////////////////////////////////////////////////////////////////////////////////
 bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n)
 {
+    // Check dew/power controller interface
+    if (PI::processSwitch(dev, name, states, names, n))
+        return true;
+
     if (strcmp(dev, getDeviceName()) == 0)
     {
         // Approach Direction
@@ -1233,6 +1314,10 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
 /////////////////////////////////////////////////////////////////////////////////////
 bool CelestronAUX::ISNewText(const char *dev, const char *name, char *texts[], char *names[], int n)
 {
+    // Channel labels for the dew/power controller
+    if (PI::processText(dev, name, texts, names, n))
+        return true;
+
     if (!strcmp(dev, getDeviceName()))
         ProcessAlignmentTextProperties(this, name, texts, names, n);
 
@@ -2103,6 +2188,20 @@ void CelestronAUX::TimerHit()
         }
     }
 
+    // Dew/power telemetry. Deliberately slower than the mount's poll: these
+    // are several AUX round-trips per port and nothing here changes quickly,
+    // so there is no reason to compete with tracking for the bus.
+    if (isConnected() && m_HasDewPower)
+    {
+        struct timeval now;
+        gettimeofday(&now, nullptr);
+        if (now.tv_sec - m_LastDewPowerUpdate.tv_sec >= DEWPOWER_POLL_SECONDS)
+        {
+            pollDewPower();
+            m_LastDewPowerUpdate = now;
+        }
+    }
+
     if(!enforceSlewLimits())
         return;
 
@@ -2935,6 +3034,431 @@ bool CelestronAUX::focusByRate(int8_t rate)
 };
 
 /////////////////////////////////////////////////////////////////////////////////////
+/// Smart DewHeater & Power Controller (AUX target DEW_POWER_CTRL)
+///
+/// Detection mirrors the focuser: probe GET_VERSION and treat a timeout as
+/// "not fitted", so a mount without a controller behaves exactly as before.
+/// Protocol specifics, and which parts are measured rather than assumed, are
+/// documented in auxproto.h.
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::detectDewPower()
+{
+    m_HasDewPower = false;
+    m_DewPowerPorts.clear();
+    m_DewChannelPorts.clear();
+    m_PowerChannelPorts.clear();
+    memset(m_DewPowerVersion, 0, sizeof(m_DewPowerVersion));
+
+    // A controller that is not there simply does not answer.
+    if (!getVersion(DEW_POWER_CTRL))
+        return false;
+    if (!(m_DewPowerVersion[0] || m_DewPowerVersion[1]))
+    {
+        LOG_DEBUG("No response from the dew/power controller; assuming none fitted.");
+        return false;
+    }
+
+    LOGF_INFO("Detected Smart DewHeater/Power Controller, firmware %d.%d",
+              m_DewPowerVersion[0], m_DewPowerVersion[1]);
+
+    m_NumDewPowerPorts = 0;
+    AUXCommand ports(PORTCTRL_GET_NUMBER_OF_PORTS, APP, DEW_POWER_CTRL);
+    if (!sendAUXCommand(ports) || !readAUXResponse(ports) || m_NumDewPowerPorts == 0)
+    {
+        LOG_ERROR("Dew/power controller answered GET_VERSION but not GET_NUMBER_OF_PORTS.");
+        return false;
+    }
+    LOGF_INFO("Dew/power controller reports %d ports.", m_NumDewPowerPorts);
+
+    m_DewPowerPorts.resize(m_NumDewPowerPorts);
+    size_t dewPorts = 0, powerPorts = 0, variablePorts = 0;
+    for (uint8_t i = 0; i < m_NumDewPowerPorts; i++)
+    {
+        if (!getDewPowerPortInfo(i))
+        {
+            LOGF_WARN("Dew/power port %d did not report its type; ignoring it.", i);
+            continue;
+        }
+
+        auto &port = m_DewPowerPorts[i];
+        switch (port.category())
+        {
+            case PORTCTRL_CAT_DEW:
+                port.indiIndex = dewPorts++;
+                m_DewChannelPorts.push_back(i);
+                getDewHeaterPortInfo(i);
+                break;
+            case PORTCTRL_CAT_POWER:
+                port.indiIndex = powerPorts++;
+                m_PowerChannelPorts.push_back(i);
+                break;
+            default:
+                // Unrecognised category. Say so loudly rather than silently
+                // dropping the port the way the standalone driver does -- on a
+                // 2X the port it drops is the one powering the mount.
+                LOGF_WARN("Dew/power port %d has unknown type 0x%02X (category %d). "
+                          "Please report this; it is not handled.",
+                          i, port.type, port.category());
+                break;
+        }
+    }
+
+    if (m_DewChannelPorts.empty() && m_PowerChannelPorts.empty())
+    {
+        LOG_ERROR("Dew/power controller reported no usable ports.");
+        return false;
+    }
+
+    uint32_t capabilities = POWER_HAS_VOLTAGE_SENSOR | POWER_HAS_OVERALL_CURRENT |
+                            POWER_HAS_LED_TOGGLE;
+    if (!m_PowerChannelPorts.empty())
+        capabilities |= POWER_HAS_DC_OUT | POWER_HAS_PER_PORT_CURRENT;
+    if (!m_DewChannelPorts.empty())
+        capabilities |= POWER_HAS_DEW_OUT | POWER_HAS_AUTO_DEW | POWER_HAS_PER_PORT_CURRENT;
+
+    PI::SetCapability(capabilities);
+    PI::initProperties(POWER_TAB, powerPorts, dewPorts, variablePorts, dewPorts, 0);
+
+    // Per-port dew aggression. PowerInterface's auto-dew switch is a plain
+    // on/off, but the controller holds a settable "degrees above dew point"
+    // per port, and the 2X ships with different values on each.
+    if (dewPorts > 0)
+    {
+        DewAggressionNP.resize(dewPorts);
+        for (size_t i = 0; i < dewPorts; i++)
+        {
+            const auto &port = m_DewPowerPorts[m_DewChannelPorts[i]];
+            char name[32], label[64];
+            snprintf(name, sizeof(name), "DEW_AGGRESSION_%zu", i + 1);
+            snprintf(label, sizeof(label), "Dew %zu above dew point (C)", i + 1);
+            DewAggressionNP[i].fill(name, label, "%.0f", 0, 20, 1, port.aggression_C);
+        }
+        DewAggressionNP.fill(getDeviceName(), "DEW_AGGRESSION", "Dew aggression",
+                             DEW_TAB, IP_RW, 60, IPS_IDLE);
+    }
+
+    m_HasDewPower = true;
+    setDriverInterface(getDriverInterface() | POWER_INTERFACE | WEATHER_INTERFACE);
+    syncDriverInfo();
+
+    getDewPowerInputPower();
+    getDewPowerLEDBrightness();
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+/// An IDLE port answers with only its 1-byte type; the full 7-byte telemetry
+/// appears only while it draws current. Confirmed on hardware -- insisting on
+/// 7 bytes would misclassify every idle port, which is the normal state at
+/// connect time.
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::getDewPowerPortInfo(uint8_t port)
+{
+    AUXCommand cmd(PORTCTRL_GET_PORT_INFO, APP, DEW_POWER_CTRL);
+    cmd.setData(port, 1);
+    m_DewPowerPortInFlight = port;
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    return port < m_DewPowerPorts.size() && m_DewPowerPorts[port].type != 0;
+}
+
+bool CelestronAUX::getDewHeaterPortInfo(uint8_t port)
+{
+    AUXCommand cmd(PORTCTRL_GET_DH_PORT_INFO, APP, DEW_POWER_CTRL);
+    cmd.setData(port, 1);
+    m_DewPowerPortInFlight = port;
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    return true;
+}
+
+bool CelestronAUX::getDewPowerInputPower()
+{
+    AUXCommand cmd(PORTCTRL_GET_INPUT_POWER, APP, DEW_POWER_CTRL);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    return true;
+}
+
+bool CelestronAUX::getDewPowerLEDBrightness()
+{
+    AUXCommand cmd(PORTCTRL_GET_LED_BRIGHTNESS, APP, DEW_POWER_CTRL);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::setDewPowerPortEnabled(uint8_t port, bool enabled)
+{
+    AUXBuffer payload {port, static_cast<uint8_t>(enabled ? 1 : 0)};
+    AUXCommand cmd(PORTCTRL_SET_PORT_ENABLED, APP, DEW_POWER_CTRL, payload);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    if (port < m_DewPowerPorts.size())
+        m_DewPowerPorts[port].enabled = enabled;
+    return true;
+}
+
+bool CelestronAUX::setDewHeaterManual(uint8_t port, uint8_t dutyCycle)
+{
+    // The controller does NOT validate this -- 150 is stored verbatim. Clamp
+    // here so a bad client value cannot command a heater out of range.
+    if (dutyCycle > DEW_DUTY_MAX)
+    {
+        LOGF_WARN("Dew duty cycle %d%% out of range; clamping to %d%%.", dutyCycle, DEW_DUTY_MAX);
+        dutyCycle = DEW_DUTY_MAX;
+    }
+    AUXBuffer payload {port, dutyCycle};
+    AUXCommand cmd(PORTCTRL_DH_ENABLE_MANUAL, APP, DEW_POWER_CTRL, payload);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    if (port < m_DewPowerPorts.size())
+    {
+        m_DewPowerPorts[port].autoMode = false;
+        m_DewPowerPorts[port].dutyCycle = dutyCycle;
+    }
+    return true;
+}
+
+bool CelestronAUX::setDewHeaterAuto(uint8_t port, uint8_t aggression_C)
+{
+    // Byte 1 is the AGGRESSION in degrees C, not a mode. Measured by writing
+    // 3, 5 and 9 and reading each back. Byte 2's meaning is unknown: every
+    // value tried produced no observable change, so send a constant.
+    AUXBuffer payload {port, aggression_C, 0x01};
+    AUXCommand cmd(PORTCTRL_DH_ENABLE_AUTO, APP, DEW_POWER_CTRL, payload);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    if (port < m_DewPowerPorts.size())
+    {
+        m_DewPowerPorts[port].autoMode = true;
+        m_DewPowerPorts[port].aggression_C = aggression_C;
+    }
+    return true;
+}
+
+bool CelestronAUX::setDewPowerLEDBrightness(uint8_t brightness)
+{
+    AUXCommand cmd(PORTCTRL_SET_LED_BRIGHTNESS, APP, DEW_POWER_CTRL);
+    cmd.setData(brightness, 1);
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd))
+        return false;
+    m_DewPowerLEDBrightness = brightness;
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+int CelestronAUX::busPortForDewChannel(size_t channel) const
+{
+    if (channel >= m_DewChannelPorts.size())
+        return -1;
+    return m_DewChannelPorts[channel];
+}
+
+int CelestronAUX::busPortForPowerChannel(size_t channel) const
+{
+    if (channel >= m_PowerChannelPorts.size())
+        return -1;
+    return m_PowerChannelPorts[channel];
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::SetPowerPort(size_t port, bool enabled)
+{
+    int busPort = busPortForPowerChannel(port);
+    if (busPort < 0)
+        return false;
+    return setDewPowerPortEnabled(busPort, enabled);
+}
+
+bool CelestronAUX::SetDewPort(size_t port, bool enabled, double dutyCycle)
+{
+    int busPort = busPortForDewChannel(port);
+    if (busPort < 0)
+        return false;
+
+    // Switching the channel off cuts the port itself, rather than merely
+    // commanding 0% -- that way "off" survives the auto-dew loop, which would
+    // otherwise raise the duty cycle again on the next tick.
+    if (!enabled)
+        return setDewPowerPortEnabled(busPort, false);
+
+    // Make sure the port is actually powered before setting a duty on it.
+    if (!m_DewPowerPorts[busPort].enabled && !setDewPowerPortEnabled(busPort, true))
+        return false;
+
+    // Setting a duty cycle explicitly means manual control, which overrides
+    // auto. setDewHeaterManual() clamps, since the controller does not.
+    return setDewHeaterManual(busPort, static_cast<uint8_t>(std::round(
+                                  std::min(std::max(dutyCycle, 0.0), 100.0))));
+}
+
+bool CelestronAUX::SetVariablePort(size_t port, bool enabled, double voltage)
+{
+    // No variable-voltage port has ever been seen on the bus. The 4X is
+    // documented to have one (power port #1, 3.0-11.0 V or 12.0 V) but how it
+    // is identified in the port type byte is unknown, so none is ever
+    // advertised and this should not be reachable.
+    INDI_UNUSED(port);
+    INDI_UNUSED(enabled);
+    INDI_UNUSED(voltage);
+    LOG_ERROR("Variable voltage ports are not supported: none has been identified on the AUX bus.");
+    return false;
+}
+
+bool CelestronAUX::SetLEDEnabled(bool enabled)
+{
+    // The controller takes a brightness, not a boolean. Full brightness is
+    // what it ships at; 0 is the closest thing to "off" it offers.
+    return setDewPowerLEDBrightness(enabled ? 0xff : 0x00);
+}
+
+bool CelestronAUX::SetAutoDewEnabled(size_t port, bool enabled)
+{
+    int busPort = busPortForDewChannel(port);
+    if (busPort < 0)
+        return false;
+    if (enabled)
+        return setDewHeaterAuto(busPort, m_DewPowerPorts[busPort].aggression_C);
+    // Leaving auto means pinning the duty cycle where it is now.
+    return setDewHeaterManual(busPort, m_DewPowerPorts[busPort].dutyCycle);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+IPState CelestronAUX::updateWeather()
+{
+    if (!m_HasDewPower)
+        return IPS_IDLE;
+
+    AUXCommand cmd(PORTCTRL_GET_ENVIRONMENT, APP, DEW_POWER_CTRL);
+    m_DewPowerEnvironmentValid = false;
+    if (!sendAUXCommand(cmd) || !readAUXResponse(cmd) || !m_DewPowerEnvironmentValid)
+        return IPS_ALERT;
+
+    setParameterValue("WEATHER_AMBIENT_TEMPERATURE", m_DewPowerAmbient_C);
+    setParameterValue("WEATHER_DEW_POINT", m_DewPowerDewPoint_C);
+    setParameterValue("WEATHER_HUMIDITY", m_DewPowerHumidity);
+    return IPS_OK;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+void CelestronAUX::pollDewPower()
+{
+    if (!m_HasDewPower)
+        return;
+
+    getDewPowerInputPower();
+
+    PI::PowerSensorsNP[PI::SENSOR_VOLTAGE].setValue(m_DewPowerVoltage_mV / 1000.0);
+    PI::PowerSensorsNP[PI::SENSOR_CURRENT].setValue(m_DewPowerCurrent_mA / 1000.0);
+    PI::PowerSensorsNP[PI::SENSOR_POWER].setValue(
+        (m_DewPowerVoltage_mV / 1000.0) * (m_DewPowerCurrent_mA / 1000.0));
+    PI::PowerSensorsNP.setState(IPS_OK);
+    PI::PowerSensorsNP.apply();
+
+    PowerStatusLP[POWER_STATUS_OVERCURRENT].setState(m_DewPowerOvercurrent ? IPS_ALERT : IPS_OK);
+    PowerStatusLP[POWER_STATUS_UNDERVOLTAGE].setState(m_DewPowerVoltageStatus < 0 ? IPS_ALERT : IPS_OK);
+    PowerStatusLP[POWER_STATUS_OVERVOLTAGE].setState(m_DewPowerVoltageStatus > 0 ? IPS_ALERT : IPS_OK);
+    PowerStatusLP.apply();
+
+    // Power (12V output) channels.
+    for (size_t i = 0; i < m_PowerChannelPorts.size(); i++)
+    {
+        const auto &port = m_DewPowerPorts[m_PowerChannelPorts[i]];
+        getDewPowerPortInfo(m_PowerChannelPorts[i]);
+        if (i < PI::PowerChannelsSP.count())
+        {
+            PI::PowerChannelsSP[i].setState(port.enabled ? ISS_ON : ISS_OFF);
+        }
+        if (i < PI::PowerChannelCurrentNP.count())
+        {
+            // The controller reports milliwatts; derive amps from the measured
+            // port voltage, falling back to the input rail when the port is
+            // idle and reports no voltage of its own.
+            double volts = port.voltage_mV ? port.voltage_mV / 1000.0 : m_DewPowerVoltage_mV / 1000.0;
+            PI::PowerChannelCurrentNP[i].setValue(volts > 0 ? (port.power_mW / 1000.0) / volts : 0);
+        }
+    }
+    if (PI::PowerChannelsSP.count())
+    {
+        PI::PowerChannelsSP.setState(IPS_OK);
+        PI::PowerChannelsSP.apply();
+    }
+    if (PI::PowerChannelCurrentNP.count())
+    {
+        PI::PowerChannelCurrentNP.setState(IPS_OK);
+        PI::PowerChannelCurrentNP.apply();
+    }
+
+    // Dew heater channels.
+    for (size_t i = 0; i < m_DewChannelPorts.size(); i++)
+    {
+        uint8_t busPort = m_DewChannelPorts[i];
+        getDewHeaterPortInfo(busPort);
+        const auto &port = m_DewPowerPorts[busPort];
+
+        // Report the port's own enabled state, NOT "duty > 0".
+        // PowerInterface only forwards a duty-cycle change when this switch is
+        // already on (indipowerinterface.cpp:491), so deriving it from the duty
+        // would deadlock a port resting at 0%: it would read Off, and being Off
+        // would make every duty change a no-op.
+        //
+        // Note an idle port's GET_PORT_INFO reply carries only its type byte,
+        // with no enabled flag, so this is the last known value -- which
+        // defaults to true, matching a controller fresh out of the box.
+        if (i < PI::DewChannelsSP.count())
+            PI::DewChannelsSP[i].setState(port.enabled ? ISS_ON : ISS_OFF);
+        if (i < PI::DewChannelDutyCycleNP.count())
+            PI::DewChannelDutyCycleNP[i].setValue(port.dutyCycle);
+        if (i < PI::DewChannelCurrentNP.count())
+        {
+            double volts = m_DewPowerVoltage_mV / 1000.0;
+            PI::DewChannelCurrentNP[i].setValue(volts > 0 ? (port.power_mW / 1000.0) / volts : 0);
+        }
+        if (i < PI::AutoDewSP.count())
+            PI::AutoDewSP[i].setState(port.autoMode ? ISS_ON : ISS_OFF);
+        if (i < DewAggressionNP.count())
+            DewAggressionNP[i].setValue(port.aggression_C);
+    }
+    if (PI::DewChannelsSP.count())
+    {
+        PI::DewChannelsSP.setState(IPS_OK);
+        PI::DewChannelsSP.apply();
+    }
+    if (PI::DewChannelDutyCycleNP.count())
+    {
+        PI::DewChannelDutyCycleNP.setState(IPS_OK);
+        PI::DewChannelDutyCycleNP.apply();
+    }
+    if (PI::DewChannelCurrentNP.count())
+    {
+        PI::DewChannelCurrentNP.setState(IPS_OK);
+        PI::DewChannelCurrentNP.apply();
+    }
+    if (PI::AutoDewSP.count())
+    {
+        PI::AutoDewSP.setState(IPS_OK);
+        PI::AutoDewSP.apply();
+    }
+    if (DewAggressionNP.count())
+    {
+        DewAggressionNP.setState(IPS_OK);
+        DewAggressionNP.apply();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
 ///
 /////////////////////////////////////////////////////////////////////////////////////
 bool CelestronAUX::setCordWrapEnabled(bool enable)
@@ -3341,6 +3865,108 @@ bool CelestronAUX::processResponse(AUXCommand &m)
     {
         // Avoid infinite loop by not responding to ourselves
         emulateGPS(m);
+    }
+    else if (m.destination() == APP && m.source() == DEW_POWER_CTRL)
+    {
+        // Handled separately from the switch below, because the controller's
+        // command bytes overlap the motor-controller set: PORTCTRL 0x10, 0x12,
+        // 0x17 and 0x18 collide with GET_VOLTAGE, MC_LEVEL_DONE, MC_GOTO_SLOW
+        // and MC_SEEK_DONE respectively.
+        const auto &data = m.data();
+        switch (m.command())
+        {
+            case GET_VER:
+                // 2 bytes here where a motor controller sends 4.
+                for (size_t i = 0; i < std::min(sizeof(m_DewPowerVersion), m.dataSize()); i++)
+                    m_DewPowerVersion[i] = data[i];
+                break;
+
+            case PORTCTRL_GET_NUMBER_OF_PORTS:
+                if (m.dataSize() >= 1)
+                    m_NumDewPowerPorts = data[0];
+                break;
+
+            case PORTCTRL_GET_INPUT_POWER:
+                if (m.dataSize() >= 6)
+                {
+                    m_DewPowerVoltage_mV = (data[0] << 8) | data[1];
+                    m_DewPowerCurrent_mA = (data[2] << 8) | data[3];
+                    m_DewPowerVoltageStatus = static_cast<int8_t>(data[4]);
+                    m_DewPowerOvercurrent = data[5];
+                }
+                break;
+
+            case PORTCTRL_GET_PORT_INFO:
+            {
+                // The port index is not echoed, so pair the reply with the
+                // request we just sent.
+                size_t port = m_DewPowerPortInFlight;
+                if (port < m_DewPowerPorts.size() && m.dataSize() >= 1)
+                {
+                    auto &p = m_DewPowerPorts[port];
+                    p.type = data[0];
+                    if (m.dataSize() >= 7)
+                    {
+                        p.enabled = data[1] != 0;
+                        p.shorted = data[2] != 0;
+                        p.power_mW = (data[3] << 8) | data[4];
+                        p.voltage_mV = (data[5] << 8) | data[6];
+                    }
+                    else
+                    {
+                        // Idle: only the type is reported, so the port is
+                        // drawing nothing. Leave `enabled` as last known.
+                        p.power_mW = 0;
+                        p.voltage_mV = 0;
+                        p.shorted = false;
+                    }
+                }
+            }
+            break;
+
+            case PORTCTRL_GET_DH_PORT_INFO:
+            {
+                size_t port = m_DewPowerPortInFlight;
+                if (port < m_DewPowerPorts.size() && m.dataSize() >= 6)
+                {
+                    auto &p = m_DewPowerPorts[port];
+                    int8_t flag = static_cast<int8_t>(data[1]);
+                    p.type = data[0];
+                    p.shorted = (flag == PORTCTRL_DH_SHORTED);
+                    p.autoMode = (flag == PORTCTRL_DH_AUTO);
+                    p.dutyCycle = data[2];
+                    p.power_mW = (data[3] << 8) | data[4];
+                    p.aggression_C = data[5];
+                }
+            }
+            break;
+
+            case PORTCTRL_GET_ENVIRONMENT:
+                if (m.dataSize() >= 9)
+                {
+                    int32_t ambient_mC = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+                    int32_t dewPoint_mC = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
+                    m_DewPowerAmbient_C = ambient_mC / 1000.0;
+                    m_DewPowerDewPoint_C = dewPoint_mC / 1000.0;
+                    m_DewPowerHumidity = data[8];
+                    m_DewPowerEnvironmentValid = true;
+                }
+                break;
+
+            case PORTCTRL_GET_LED_BRIGHTNESS:
+                if (m.dataSize() >= 1)
+                    m_DewPowerLEDBrightness = data[0];
+                break;
+
+            case PORTCTRL_NAK:
+                LOGF_DEBUG("Dew/power controller NAK'd command 0x%02X.",
+                           m.dataSize() ? data[0] : 0);
+                break;
+
+            default:
+                // Writes echo their own command byte with no payload.
+                break;
+        }
     }
     else if (m.destination() == APP)
     {
