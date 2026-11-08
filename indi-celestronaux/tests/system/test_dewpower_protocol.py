@@ -272,13 +272,37 @@ def test_port_info_out_of_range_is_nakd(scope_4x):
 # Dew heater ports
 # --------------------------------------------------------------------------- #
 def test_dh_port_info_layout(ctrl_4x):
-    ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x01\x07')     # auto above dew point
+    ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x07\x01')     # aggression 7 C
     _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
     assert len(data) >= 6
     assert dp.port_category(data[0]) == dp.CAT_DEW
-    assert struct.unpack('!b', data[1:2])[0] == dp.DH_AUTO_ABOVE_DEWPT
+    assert struct.unpack('!b', data[1:2])[0] == dp.DH_AUTO
     assert 0 <= data[2] <= 100
-    assert data[5] == 7, 'aggression level should round-trip'
+    assert data[5] == 7, 'aggression should round-trip from byte 1 of the write'
+
+
+def test_dh_enable_auto_second_byte_is_aggression(ctrl_4x):
+    """
+    MEASURED on the 2X: DH_ENABLE_AUTO's second byte is the aggression in C,
+    not a mode. Writing 3, 5 and 9 read straight back in byte 5. The
+    standalone driver sends (port, mode, temp_C) and so would write its mode
+    value into the aggression field.
+    """
+    for aggression in (3, 5, 9):
+        ctrl_4x.handle(dp.DH_ENABLE_AUTO, bytes((0, aggression, 1)))
+        _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+        assert data[5] == aggression
+        assert struct.unpack('!b', data[1:2])[0] == dp.DH_AUTO
+
+
+def test_byte1_is_a_plain_auto_manual_flag(ctrl_4x):
+    """Not the four-valued nmode the standalone driver documents."""
+    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x0a')
+    _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert struct.unpack('!b', data[1:2])[0] == dp.DH_MANUAL
+    ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x05\x01')
+    _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert struct.unpack('!b', data[1:2])[0] == dp.DH_AUTO
 
 
 def test_dh_port_info_nakd_on_power_port(ctrl_4x):
@@ -311,14 +335,38 @@ def test_manual_mode_sets_duty_cycle(ctrl_4x):
     assert struct.unpack('!H', data[3:5])[0] == 450
 
 
-def test_manual_duty_cycle_above_100_rejected(ctrl_4x):
-    assert ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x65')[0] == dp.NAK
+def test_manual_duty_cycle_above_100_is_accepted_verbatim(ctrl_4x):
+    """
+    MEASURED: the controller does not validate the duty cycle. Sending 150
+    stored 150 (read back as 0x96). So 0-100 is a convention the firmware does
+    not enforce, and OUR DRIVER must clamp before sending -- the simulator
+    deliberately does not, so that a missing clamp shows up in testing.
+    """
+    assert ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x96')[0] == dp.DH_ENABLE_MANUAL
+    _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert data[2] == 150
 
 
-def test_auto_mode_with_bad_mode_rejected(ctrl_4x):
-    """Only auto_above_dewpoint (1) and auto_above_ambient (2) are valid."""
-    assert ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x00\x05')[0] == dp.NAK
-    assert ctrl_4x.handle(dp.DH_ENABLE_AUTO, b'\x00\x09\x05')[0] == dp.NAK
+def test_auto_accepts_any_aggression_without_validating(ctrl_4x):
+    """Every aggression value offered to the real controller was accepted."""
+    for aggression in (0, 1, 9, 20):
+        assert ctrl_4x.handle(dp.DH_ENABLE_AUTO,
+                              bytes((0, aggression, 1)))[0] == dp.DH_ENABLE_AUTO
+
+
+def test_self_heater_is_one_way(ctrl_4x):
+    """
+    MEASURED: once on, firmware 1.0 will not report it off again. Every
+    payload (empty, 0x00, 0xFF) was ACKed but SELF_HEATER_STATUS stayed 0x01.
+    The driver must not offer an "off" switch that silently does nothing.
+    """
+    assert ctrl_4x.handle(dp.SELF_HEATER_STATUS, b'')[1] == b'\x00'
+    ctrl_4x.handle(dp.ENABLE_SELF_HEATER, b'\x01')
+    assert ctrl_4x.handle(dp.SELF_HEATER_STATUS, b'')[1] == b'\x01'
+    for payload in (b'\x00', b'', b'\xff'):
+        ctrl_4x.handle(dp.ENABLE_SELF_HEATER, payload)
+        assert ctrl_4x.handle(dp.SELF_HEATER_STATUS, b'')[1] == b'\x01', \
+            'should latch on, as the real controller does'
 
 
 def test_auto_dew_raises_duty_when_lens_is_below_target(ctrl_4x):

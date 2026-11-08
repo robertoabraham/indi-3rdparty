@@ -156,9 +156,21 @@ def port_category(type_code):
 def port_index(type_code):
     return type_code & 0x0F
 
-# Dew heater modes, as reported in byte 1 of GET_DH_PORT_INFO (signed).
-DH_SHORTED            = -1
-DH_MANUAL             = 0
+# Byte 1 of GET_DH_PORT_INFO (signed). Measured on the 2X: it is a plain
+# auto/manual flag, NOT the four-valued "nmode" the standalone driver
+# documents. DH_ENABLE_MANUAL drives it to 0 and DH_ENABLE_AUTO to 1, and no
+# write produced any other value. DH_SHORTED is retained as plausible but is
+# UNVERIFIED -- we had nothing shorted to test with.
+DH_SHORTED = -1
+DH_MANUAL  = 0
+DH_AUTO    = 1
+
+# Kept so older code reads sensibly; both of these are "auto" on the wire. The
+# distinction between auto-above-dew-point and auto-above-ambient is NOT
+# visible in the 6-byte GET_DH_PORT_INFO response, and the third byte of
+# DH_ENABLE_AUTO -- which the standalone driver believes carries the target
+# temperature -- produced no observable change for any value tried (1, 3, 5,
+# 7, 9, and a four-byte payload). Its meaning is unknown.
 DH_AUTO_ABOVE_DEWPT   = 1
 DH_AUTO_ABOVE_AMBIENT = 2
 
@@ -219,12 +231,13 @@ class Port:
         self.voltage_mV = voltage_mV
         self.load_mW = load_mW
         self.variable = variable
-        # Dew-heater-only state. Both of the 2X's dew ports were found in
-        # auto-above-dew-point mode at 0% duty, which is the idle resting state.
-        self.mode = DH_AUTO_ABOVE_DEWPT if self.is_dew else DH_MANUAL
-        self.power_level = 0          # 0..100 %
+        # Dew-heater-only state. Both of the 2X's dew ports were found in auto
+        # at 0% duty, which is the idle resting state.
+        self.auto = self.is_dew
+        self.power_level = 0          # 0..100 nominally; hardware does not clamp
         self.aggression_C = aggression_C
         self.heater_temp_mC = None    # only present when a thermistor is fitted
+        self.auto_param = None        # DH_ENABLE_AUTO byte 2; meaning unknown
 
     @property
     def category(self):
@@ -336,11 +349,12 @@ class DewPowerController:
 
         dp = dew_point_c(self.ambient_C, self.humidity)
         for p in self.ports:
-            if not p.is_dew or not p.enabled:
+            if not p.is_dew or not p.enabled or not p.auto or p.shorted:
                 continue
-            if p.mode == DH_MANUAL or p.mode == DH_SHORTED:
-                continue
-            target = (dp if p.mode == DH_AUTO_ABOVE_DEWPT else self.ambient_C) + p.aggression_C
+            # Hold the optic this far above the dew point. Whether the real
+            # controller can instead track ambient is not observable over AUX,
+            # so only the dew-point form is modelled.
+            target = dp + p.aggression_C
             # Lens temperature trails ambient; heat it toward the target.
             lens = p.heater_temp_mC / 1000.0 if p.heater_temp_mC is not None else self.ambient_C
             deficit = target - lens
@@ -414,20 +428,25 @@ class DewPowerController:
 
     def _get_dh_port_info(self, data):
         """
-        <0 type><1 mode (signed)><2 power level><3:4 power mW><5 aggression C>
+        <0 type><1 auto flag (signed)><2 duty><3:4 power mW><5 aggression C>
         and, when a thermistor is fitted, <6:9 heater temperature mC>.
 
-        NAK'd on a non-dew port, which is the behaviour the standalone driver
-        records observing on real hardware.
+        Byte 1 and byte 5 are as MEASURED on the 2X, and differ from the
+        standalone driver's reading: byte 1 is a plain auto(1)/manual(0) flag,
+        and byte 5 is the aggression in C, which DH_ENABLE_AUTO sets from its
+        *second* byte. Verified by writing aggressions 3, 5 and 9 and reading
+        each back unchanged.
+
+        NAK'd on a non-dew port, as observed.
         """
         p = self._port(data)
         if p is None or not p.is_dew:
             return _NAK
-        mode = DH_SHORTED if p.shorted else p.mode
-        out = (bytes((p.type,)) + struct.pack('!b', mode)
-               + bytes((p.power_level,))
+        flag = DH_SHORTED if p.shorted else (DH_AUTO if p.auto else DH_MANUAL)
+        out = (bytes((p.type,)) + struct.pack('!b', flag)
+               + bytes((p.power_level & 0xFF,))
                + struct.pack('!H', p.power_mW())
-               + bytes((p.aggression_C,)))
+               + bytes((p.aggression_C & 0xFF,)))
         if p.heater_temp_mC is not None:
             out += struct.pack('!i', p.heater_temp_mC)
         return out
@@ -461,25 +480,41 @@ class DewPowerController:
         return b''
 
     def _dh_enable_auto(self, data):
-        """<0 port><1 mode><2 aggression C>"""
-        p = self._port(data)
-        if p is None or not p.is_dew or len(data) < 3:
-            return _NAK
-        mode = data[1]
-        if mode not in (DH_AUTO_ABOVE_DEWPT, DH_AUTO_ABOVE_AMBIENT):
-            return _NAK
-        p.mode = mode
-        p.aggression_C = data[2]
-        return b''
+        """
+        <0 port><1 aggression C><2 unknown>
 
-    def _dh_enable_manual(self, data):
-        """<0 port><1 power level 0-100>"""
+        MEASURED: byte 1 is the aggression, not a mode -- writing 3/5/9 reads
+        straight back in byte 5 of GET_DH_PORT_INFO. Byte 2 is accepted but had
+        no observable effect for any value tried, so it is stored and ignored
+        rather than validated. The standalone driver sends (port, mode, temp_C)
+        here, which would write its *mode* into the aggression field.
+
+        The real controller does not validate: every aggression value offered
+        was accepted. So no range check here either.
+        """
         p = self._port(data)
         if p is None or not p.is_dew or len(data) < 2:
             return _NAK
-        if data[1] > 100:
+        p.auto = True
+        p.aggression_C = data[1]
+        if len(data) >= 3:
+            p.auto_param = data[2]      # meaning unknown; recorded for later
+        return b''
+
+    def _dh_enable_manual(self, data):
+        """
+        <0 port><1 duty cycle>
+
+        MEASURED: the controller does NOT validate the duty cycle. Sending 150
+        stored 150 verbatim (read back as 0x96), so the documented 0-100 range
+        is a convention, not something the firmware enforces. Reproduced
+        faithfully -- our driver has to clamp before sending, and this is what
+        makes a test for that meaningful.
+        """
+        p = self._port(data)
+        if p is None or not p.is_dew or len(data) < 2:
             return _NAK
-        p.mode = DH_MANUAL
+        p.auto = False
         p.power_level = data[1]
         return b''
 
@@ -491,8 +526,16 @@ class DewPowerController:
                 + bytes((int(round(self.humidity)),)))
 
     def _enable_self_heater(self, data):
-        if len(data) >= 1:
-            self.self_heater = bool(data[0])
+        """
+        MEASURED: this is effectively one-way on firmware 1.0. Every payload
+        offered (empty, 0x00, 0xFF, 0x00 repeated) was ACKed, but once the
+        self heater had been switched on SELF_HEATER_STATUS stayed 0x01 and
+        would not return to 0x00. So the sensor heater latches on, presumably
+        until a power cycle or until the firmware's own humidity logic releases
+        it. Reproduced so the driver cannot ship a working "off" switch that
+        does nothing on real hardware -- expose it as one-way, or not at all.
+        """
+        self.self_heater = True
         return b''
 
     def _self_heater_status(self, data):
