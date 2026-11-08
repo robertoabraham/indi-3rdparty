@@ -234,7 +234,7 @@ class CelestronAUX :
         bool getEncoder(INDI_HO_AXIS axis);
 
         /////////////////////////////////////////////////////////////////////////////////////
-        /// Coord Wrap
+        /// Cord Wrap
         /////////////////////////////////////////////////////////////////////////////////////
         bool setCordWrapEnabled(bool enable);
         bool getCordWrapEnabled();
@@ -357,7 +357,7 @@ class CelestronAUX :
         uint8_t m_GPSVersion[4] {0};
         uint8_t m_FocusVersion[4] {0};
 
-        // Coord Wrap
+        // Cord Wrap
         bool m_CordWrapActive {false};
         int32_t m_CordWrapPosition {0};
         uint32_t m_RequestedCordwrapPos;
@@ -533,8 +533,8 @@ class CelestronAUX :
         static constexpr uint8_t READ_TIMEOUT {1};
         // ms
         static constexpr uint8_t CTS_TIMEOUT {100};
-        // Coord Wrap
-        static constexpr const char *CORDWRAP_TAB {"Coord Wrap"};
+        // Cord Wrap
+        static constexpr const char *CORDWRAP_TAB {"Cord Wrap"};
         static constexpr const char *MOUNTINFO_TAB {"Mount Info"};
         // Track modes
         static constexpr uint16_t AUX_STOP {0x0000};
