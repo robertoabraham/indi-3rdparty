@@ -561,7 +561,12 @@ class CelestronAUX :
             uint8_t type {0};           ///< raw type byte, e.g. 0x01, 0x11
             bool enabled {true};
             bool shorted {false};
-            uint16_t power_mW {0};
+            /// Power as the controller reports it, in units of 10 mW.
+            /// NOT milliwatts, despite what the standalone driver's comments
+            /// say -- measured on a 2X with a real dew heater ring: the field
+            /// reads 744 at 100%% duty while the input current rises 652 mA at
+            /// 12.2 V, i.e. 7.9 W. Treating it as mW under-reports 10x.
+            uint16_t power_cW {0};
             uint16_t voltage_mV {0};
             // Dew ports only.
             bool autoMode {false};

@@ -231,17 +231,44 @@ def test_number_of_ports_matches_profile(scope_4x):
 # --------------------------------------------------------------------------- #
 # Port info, including the idle-port quirk
 # --------------------------------------------------------------------------- #
-def test_active_port_returns_full_telemetry(ctrl_4x):
-    """Port 0 is a dew heater with a load; drive it so it draws current."""
-    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # port 0, 100%
-    _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x00')
+def test_active_power_port_returns_full_telemetry(ctrl_4x):
+    """Port 5 is a fixed 12V output with a load, so it reports the long form."""
+    _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')
     assert len(data) == 7
     ptype, enabled, shorted = data[0], data[1], data[2]
-    power_mW, voltage_mV = struct.unpack('!HH', data[3:7])
-    assert dp.port_category(ptype) == dp.CAT_DEW
+    power_cW, voltage_mV = struct.unpack('!HH', data[3:7])
+    assert dp.port_category(ptype) == dp.CAT_POWER
     assert enabled == 1 and shorted == 0
-    assert power_mW == 1800
+    assert power_cW == 6000, "60000 mW reported as 10 mW units"
     assert voltage_mV == 12000
+
+
+def test_dew_port_never_returns_the_long_form(ctrl_4x):
+    """
+    MEASURED: a dew port answers GET_PORT_INFO with its type byte and nothing
+    else, even at 100% duty drawing 7.9 W. Its telemetry is in
+    GET_DH_PORT_INFO instead. The "full telemetry when drawing" rule applies
+    only to power ports.
+    """
+    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # port 0, 100%
+    _, data = ctrl_4x.handle(dp.GET_PORT_INFO, b'\x00')
+    assert len(data) == 1
+    assert dp.port_category(data[0]) == dp.CAT_DEW
+    # ...while the dew-specific query does report the draw.
+    _, dh = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert struct.unpack('!H', dh[3:5])[0] > 0
+
+
+def test_power_is_reported_in_ten_milliwatt_units(ctrl_4x):
+    """
+    MEASURED on a 2X with a real dew heater ring: the field reads 744 at 100%
+    duty while input current rises 652 mA at 12.2 V, i.e. 7.9 W. Treating it
+    as milliwatts -- as the standalone driver's comments do -- under-reports
+    by 10x. The 4X profile's dew port 0 carries an 1800 mW load.
+    """
+    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')      # 100%
+    _, dh = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
+    assert struct.unpack('!H', dh[3:5])[0] == 180            # 1800 mW / 10
 
 
 def test_idle_port_returns_only_its_type(ctrl_4x):
@@ -255,11 +282,10 @@ def test_idle_port_returns_only_its_type(ctrl_4x):
     assert dp.port_category(data[0]) == dp.CAT_DEW
 
 
-def test_disabling_a_port_makes_it_idle(ctrl_4x):
-    ctrl_4x.handle(dp.DH_ENABLE_MANUAL, b'\x00\x64')
-    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x00')[1]) == 7
-    ctrl_4x.handle(dp.SET_PORT_ENABLED, b'\x00\x00')
-    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x00')[1]) == 1
+def test_disabling_a_power_port_makes_it_idle(ctrl_4x):
+    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')[1]) == 7
+    ctrl_4x.handle(dp.SET_PORT_ENABLED, b'\x05\x00')
+    assert len(ctrl_4x.handle(dp.GET_PORT_INFO, b'\x05')[1]) == 1
 
 
 def test_port_info_out_of_range_is_nakd(scope_4x):
@@ -331,8 +357,10 @@ def test_manual_mode_sets_duty_cycle(ctrl_4x):
     _, data = ctrl_4x.handle(dp.GET_DH_PORT_INFO, b'\x00')
     assert struct.unpack('!b', data[1:2])[0] == dp.DH_MANUAL
     assert data[2] == 25
-    # Draw should scale with duty cycle: 25% of the 1800 mW load.
-    assert struct.unpack('!H', data[3:5])[0] == 450
+    # Draw scales with duty: 25% of 1800 mW = 450 mW, sent as 45 (x10 mW).
+    # Measured as very nearly linear on hardware: 174/364/557/744 at
+    # 25/50/75/100%.
+    assert struct.unpack('!H', data[3:5])[0] == 45
 
 
 def test_manual_duty_cycle_above_100_is_accepted_verbatim(ctrl_4x):

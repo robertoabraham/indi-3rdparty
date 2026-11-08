@@ -3383,11 +3383,11 @@ void CelestronAUX::pollDewPower()
         }
         if (i < PI::PowerChannelCurrentNP.count())
         {
-            // The controller reports milliwatts; derive amps from the measured
-            // port voltage, falling back to the input rail when the port is
-            // idle and reports no voltage of its own.
+            // The controller reports power in 10 mW units; derive amps from the
+            // measured port voltage, falling back to the input rail when the
+            // port is idle and reports no voltage of its own.
             double volts = port.voltage_mV ? port.voltage_mV / 1000.0 : m_DewPowerVoltage_mV / 1000.0;
-            PI::PowerChannelCurrentNP[i].setValue(volts > 0 ? (port.power_mW / 1000.0) / volts : 0);
+            PI::PowerChannelCurrentNP[i].setValue(volts > 0 ? (port.power_cW / 100.0) / volts : 0);
         }
     }
     if (PI::PowerChannelsSP.count())
@@ -3424,7 +3424,7 @@ void CelestronAUX::pollDewPower()
         if (i < PI::DewChannelCurrentNP.count())
         {
             double volts = m_DewPowerVoltage_mV / 1000.0;
-            PI::DewChannelCurrentNP[i].setValue(volts > 0 ? (port.power_mW / 1000.0) / volts : 0);
+            PI::DewChannelCurrentNP[i].setValue(volts > 0 ? (port.power_cW / 100.0) / volts : 0);
         }
         if (i < PI::AutoDewSP.count())
             PI::AutoDewSP[i].setState(port.autoMode ? ISS_ON : ISS_OFF);
@@ -3909,14 +3909,14 @@ bool CelestronAUX::processResponse(AUXCommand &m)
                     {
                         p.enabled = data[1] != 0;
                         p.shorted = data[2] != 0;
-                        p.power_mW = (data[3] << 8) | data[4];
+                        p.power_cW = (data[3] << 8) | data[4];
                         p.voltage_mV = (data[5] << 8) | data[6];
                     }
                     else
                     {
                         // Idle: only the type is reported, so the port is
                         // drawing nothing. Leave `enabled` as last known.
-                        p.power_mW = 0;
+                        p.power_cW = 0;
                         p.voltage_mV = 0;
                         p.shorted = false;
                     }
@@ -3935,7 +3935,7 @@ bool CelestronAUX::processResponse(AUXCommand &m)
                     p.shorted = (flag == PORTCTRL_DH_SHORTED);
                     p.autoMode = (flag == PORTCTRL_DH_AUTO);
                     p.dutyCycle = data[2];
-                    p.power_mW = (data[3] << 8) | data[4];
+                    p.power_cW = (data[3] << 8) | data[4];
                     p.aggression_C = data[5];
                 }
             }

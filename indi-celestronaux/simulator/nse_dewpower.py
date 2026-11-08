@@ -186,9 +186,9 @@ PORT_PROFILES = {
     # VERIFIED against Bob's unit (firmware 1.0) on 2026-11-08, including the
     # type codes, the per-port aggression levels, and which port draws current.
     '2x': [
-        (0x01, 12000,   0, 3, False),   # dew heater 1 -- idle, aggression 3
+        (0x01, 12000, 7440, 3, False),  # dew heater 1 -- ring fitted, 7.44 W full
         (0x02, 12000,   0, 5, False),   # dew heater 2 -- idle, aggression 5
-        (0x11, 12197, 489, 0, False),   # 12V output -- powers the mount
+        (0x11, 12197, 4890, 0, False),  # 12V output -- powers the mount, 4.89 W
     ],
     # Smart DewHeater and Power Controller 4X, #94036.
     # NOT VERIFIED. Port count (4 dew + 4 power) is from the manual; the type
@@ -200,8 +200,8 @@ PORT_PROFILES = {
         (0x02, 12000, 2400, 5, False),  # dew heater 2
         (0x03, 12000,    0, 5, False),  # dew heater 3 -- idle
         (0x04, 12000,    0, 5, False),  # dew heater 4 -- idle
-        (0x11, 12000, 2500, 0, True),   # power #1 -- variable 3.0-11.0/12.0V
-        (0x12, 12000, 6000, 0, False),  # power #2
+        (0x11, 12000, 25000, 0, True),   # power #1 -- variable 3.0-11.0/12.0V
+        (0x12, 12000, 60000, 0, False),  # power #2
         (0x13, 12000,    0, 0, False),  # power #3 -- idle
         (0x14, 12000,    0, 0, False),  # power #4 -- idle
     ],
@@ -248,13 +248,28 @@ class Port:
         return self.category == CAT_DEW
 
     def power_mW(self):
-        """Instantaneous draw. Zero unless enabled and something is plugged in."""
+        """Instantaneous draw in mW. Zero unless enabled and something is fitted."""
         if not self.enabled or self.shorted:
             return 0
         if self.is_dew:
-            # A dew heater's draw scales with its duty cycle.
+            # A dew heater's draw scales with its duty cycle -- measured as
+            # very nearly linear on real hardware: 174/364/557/744 (x10 mW)
+            # at 25/50/75/100%.
             return int(self.load_mW * self.power_level / 100.0)
         return self.load_mW
+
+    def power_wire(self):
+        """
+        Power as the controller puts it on the wire: units of **10 mW**.
+
+        NOT milliwatts, despite the standalone driver's comments. Measured on
+        a 2X with a real dew heater ring on 2026-11-08: the field reads 744 at
+        100% duty while input current rises 652 mA at 12.2 V, i.e. 7.9 W. The
+        remaining ~6% is the controller's own conversion loss. Independently
+        corroborated by the power port, which reads ~475 while feeding a mount
+        that is plainly drawing more than 0.475 W.
+        """
+        return min(self.power_mW() // 10, 0xFFFF)
 
     def is_active(self):
         """Whether the controller will report full telemetry for this port."""
@@ -421,10 +436,13 @@ class DewPowerController:
         p = self._port(data)
         if p is None:
             return _NAK
-        if not p.is_active():
+        # Measured: a DEW port answers with its type byte and nothing else,
+        # even at 100% duty drawing 7.9 W. Its telemetry lives in
+        # GET_DH_PORT_INFO instead. Only power ports ever give the long form.
+        if p.is_dew or not p.is_active():
             return bytes((p.type,))
         return (bytes((p.type, 1 if p.enabled else 0, 1 if p.shorted else 0))
-                + struct.pack('!HH', p.power_mW(), p.voltage_mV))
+                + struct.pack('!HH', p.power_wire(), p.voltage_mV))
 
     def _get_dh_port_info(self, data):
         """
@@ -445,7 +463,7 @@ class DewPowerController:
         flag = DH_SHORTED if p.shorted else (DH_AUTO if p.auto else DH_MANUAL)
         out = (bytes((p.type,)) + struct.pack('!b', flag)
                + bytes((p.power_level & 0xFF,))
-               + struct.pack('!H', p.power_mW())
+               + struct.pack('!H', p.power_wire())
                + bytes((p.aggression_C & 0xFF,)))
         if p.heater_temp_mC is not None:
             out += struct.pack('!i', p.heater_temp_mC)
